@@ -6,6 +6,7 @@ import sys
 from typing import Dict, Any, List, Tuple, Optional
 
 from pipeline.lib.find_extensions import get_all_conductors, find_extensions
+from backend.core.graph_edges import upsert_unified_edge
 
 
 def build_instance_graph(
@@ -16,17 +17,15 @@ def build_instance_graph(
     Given a network JSON (with nodes / links), compute the extension graph
     and return a compact JSON-serializable structure where:
 
-    - conductors (conductors) have purely numeric uids.
+    - conductors carry a temporary numeric uid until rewire_graph_to_laz_instance_ids removes it.
     - For each connector we expose:
         * uid          (int, local to this graph)
         * link_id      (original link index in 'links')
         * conductor_id (original conductor id inside the link)
-        * startpoint
-        * endpoint
-        * source_id
-        * target_id
+        * poles        (support pole ids)
         * component    (connected-component index in the extension graph)
-        * extensions   (list of other connector uids that extend it)
+    - Topological links are in graph_data[\"edges\"] as
+      {id, a_type, b_type, a_id, b_id, class} (extension, bifurcation, cross, support).
     - All poles (nodes) are replicated as-is from the input JSON.
     """
     nodes: List[Dict[str, Any]] = data.get("nodes", [])
@@ -65,11 +64,6 @@ def build_instance_graph(
             if pole_id is not None and pole_id not in poles_for_connector:
                 poles_for_connector.append(pole_id)
 
-        # Extensions for this conductor.
-        exts = []
-        for v in G.neighbors(uid_tuple):
-            exts.append(uid_tuple_to_numeric[v])
-
         cid = f"{c.get('link_idx')}_{c.get('id')}"
         geom_conductors[cid] = {
             "model": c.get("model"),
@@ -83,7 +77,6 @@ def build_instance_graph(
             "conductor_id": c.get("id"),
             "poles": poles_for_connector,
             "component": comp_map.get(uid_tuple),
-            "extensions": exts,
         }
         conductors.append(entry)
 
@@ -111,34 +104,38 @@ def build_instance_graph(
 
         poles.append(cleaned)
 
-    # Raw extension edges with numeric uids.
-    edges: List[List[int]] = []
+    graph_data: Dict[str, Any] = {
+        "poles": poles,
+        "conductors": conductors,
+        "edges": [],
+    }
     for u, v in G.edges():
         nu = uid_tuple_to_numeric[u]
         nv = uid_tuple_to_numeric[v]
-        edges.append([nu, nv])
-
-    # Bifurcations in numeric uid space: uid -> [uid, ...].
-    bifurcations_edges: List[List[int]] = [[] for _ in range(len(all_conductors))]
+        upsert_unified_edge(graph_data, "conductor", nu, "conductor", nv, "extension")
     for uid_tuple, others in bifurcations.items():
         nu = uid_tuple_to_numeric[uid_tuple]
-        bifurcations_edges[nu] = [uid_tuple_to_numeric[o] for o in others]
-
-    # Crosses in numeric uid space: uid -> [uid, ...] (same length as conductors).
-    crosses_edges: List[List[int]] = [[] for _ in range(len(all_conductors))]
+        for o in others:
+            nv = uid_tuple_to_numeric[o]
+            upsert_unified_edge(
+                graph_data, "conductor", nu, "conductor", nv, "bifurcation"
+            )
     for uid_tuple, others in crosses.items():
         if not others:
             continue
         nu = uid_tuple_to_numeric[uid_tuple]
-        crosses_edges[nu] = [uid_tuple_to_numeric[o] for o in others]
-
-    graph_data = {
-        "poles": poles,
-        "conductors": conductors,
-        "edges": edges,
-        "bifurcations": bifurcations_edges,
-        "crosses": crosses_edges,
-    }
+        for o in others:
+            nv = uid_tuple_to_numeric[o]
+            upsert_unified_edge(graph_data, "conductor", nu, "conductor", nv, "cross")
+    for c in all_conductors:
+        numeric_uid = uid_tuple_to_numeric[c["uid_tuple"]]
+        for pole_key in ("source_id", "target_id"):
+            pole_id = c.get(pole_key)
+            if pole_id is None:
+                continue
+            upsert_unified_edge(
+                graph_data, "conductor", numeric_uid, "pole", int(pole_id), "support"
+            )
     geom_data = {
         "poles": geom_poles,
         "conductors": geom_conductors,

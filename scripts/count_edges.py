@@ -4,44 +4,44 @@ import glob
 import csv
 from collections import defaultdict
 
+
 def count_edges():
     graph_files = glob.glob("data/graph/graph_*.json")
-    
+
     results = []
     all_rel_classes = set()
-    
+
     for gf in sorted(graph_files):
         with open(gf, "r") as f:
             data = json.load(f)
-            
+
+        edges = data.get("edges") or []
+
         tile_id = os.path.basename(gf).replace("graph_", "").replace(".json", "")
-        
+
         row = {"tile_id": tile_id}
-        
-        # 1. Conductor Extensions
-        row["extensions"] = len(data.get("edges", []))
-        
-        # 2. Conductor Bifurcations (adjacency list is symmetric, so divide by 2)
-        bifs = data.get("bifurcations", [])
-        row["bifurcations"] = sum(len(b) for b in bifs) // 2
-        
-        # 3. Conductor Crosses (symmetric, divide by 2)
-        crosses = data.get("crosses", [])
-        row["crosses"] = sum(len(c) for c in crosses) // 2
-        
-        # 4. Conductor-Pole Attachments (bipartite edges)
-        conductors = data.get("conductors", [])
-        row["conductor_pole_attachments"] = sum(len(c.get("poles", [])) for c in conductors)
-        
-        # 5. Group Relations (intra-group semantic edges)
-        group_rels = data.get("group_relations", [])
+
+        by_cls = defaultdict(int)
+        for e in edges:
+            if not isinstance(e, dict):
+                continue
+            cls = str(e.get("class", "unknown")).lower()
+            by_cls[cls] += 1
+
+        row["extensions"] = by_cls.get("extension", 0)
+        row["bifurcations"] = by_cls.get("bifurcation", 0)
+        row["crosses"] = by_cls.get("cross", 0)
+        row["conductor_pole_attachments"] = by_cls.get("support", 0) + by_cls.get(
+            "support_building", 0
+        )
+
         rel_counts = defaultdict(int)
-        for r in group_rels:
-            rel_class = r.get("class", "unknown")
-            # We prefix to make column names clear
-            col_name = f"relation_{rel_class}"
-            rel_counts[col_name] += 1
-            all_rel_classes.add(col_name)
+        for cls in ("adjacent", "near"):
+            n = by_cls.get(cls, 0)
+            if n:
+                col_name = f"relation_{cls}"
+                rel_counts[col_name] = n
+                all_rel_classes.add(col_name)
             
         # 6. Group Memberships (implicit bipartite edges: object -> group)
         group_member_edges = 0

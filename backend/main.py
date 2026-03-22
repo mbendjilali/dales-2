@@ -11,6 +11,7 @@ from typing import List, Optional, Any, Dict
 
 from backend.core.graph_manager import GraphManager, _groups_key
 from backend.core.scene_builder import build_scene_data
+from backend.core.graph_edges import to_frontend_group_relations
 
 app = FastAPI()
 
@@ -44,6 +45,7 @@ class GroupRelationUpdate(BaseModel):
     a_id: int
     b_id: int
     cls: str
+    peer_type: Optional[str] = None
 
 
 class GroupRelationBatchRequest(BaseModel):
@@ -146,7 +148,7 @@ async def edit_group(request: GroupEditRequest):
             "status": "success",
             api_key: updated_graph.get(api_key, []),
             groups_key: updated_graph.get(groups_key, []),
-            "group_relations": updated_graph.get("group_relations", []),
+            "group_relations": to_frontend_group_relations(updated_graph),
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -161,10 +163,14 @@ async def update_group_relations(tile_id: str, body: GroupRelationBatchRequest):
             graph_manager.load_tile(tile_id)
         for rel in body.relations:
             graph_manager.upsert_group_relation(
-                member_type=rel.member_type, group_id=rel.group_id,
-                a_id=rel.a_id, b_id=rel.b_id, rel_class=rel.cls,
+                member_type=rel.member_type,
+                group_id=rel.group_id,
+                a_id=rel.a_id,
+                b_id=rel.b_id,
+                rel_class=rel.cls,
+                peer_type=rel.peer_type,
             )
-        all_rels = graph_manager.graph_data.get("group_relations", [])
+        all_rels = to_frontend_group_relations(graph_manager.graph_data)
         return {"status": "success", "group_relations": all_rels}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -183,7 +189,10 @@ async def load_laz(
         from pipeline.lib.add_buildings import process_graph as process_buildings
         from pipeline.lib.add_vehicules import process_graph as process_vehicles
         from pipeline.lib.add_trees import process_graph as process_trees
+        from pipeline.lib.add_conductor_instances import process_graph as process_conductor_instances
+        from pipeline.lib.add_pole_instances import process_graph as process_pole_instances
         from pipeline.lib.generate_json_graph import adjust_instances
+        from backend.core.graph_edges import strip_proximity_edges, rewire_graph_to_laz_instance_ids
 
         tile_id = os.path.splitext(laz_file.filename)[0]
         graph_dir = os.path.join("data", "graph")
@@ -195,7 +204,7 @@ async def load_laz(
             tmp.write(await laz_file.read())
             laz_path = tmp.name
 
-        graph_data: Dict[str, Any] = {"poles": [], "conductors": [], "edges": [], "bifurcations": [], "crosses": []}
+        graph_data: Dict[str, Any] = {"poles": [], "conductors": [], "edges": []}
         geom_data: Dict[str, Any] = {"scale": 1.0, "poles": {}, "conductors": {}, "buildings": {}, "vehicles": {}, "trees": {}}
 
         if network_file is not None:
@@ -218,13 +227,18 @@ async def load_laz(
         process_buildings(graph_data, geom_data, 0.5, 8.0, laz_data)
         process_vehicles(graph_data, geom_data, 1000, 0.5, 5.0, laz_data)
         process_trees(graph_data, geom_data, 8.0, laz_data)
+        process_conductor_instances(graph_data, geom_data, laz_data)
+        process_pole_instances(graph_data, geom_data, laz_data)
+        rewire_graph_to_laz_instance_ids(graph_data, geom_data)
 
         gm = GraphManager(data_dir="data")
         gm.graph_data = graph_data
         gm.geom_data = geom_data
         gm.current_tile_id = tile_id
 
-        for object_type in ("buildings", "vehicles", "trees"):
+        strip_proximity_edges(gm.graph_data)
+
+        for object_type in ("buildings", "vehicles"):
             member_type = gm._member_type_for_object_type(object_type)
             if not member_type:
                 continue
@@ -233,6 +247,8 @@ async def load_laz(
                 gid, members = g.get("id"), g.get("members", [])
                 if gid is not None and len(members) >= 2:
                     gm._recompute_relations_for_group(member_type, gid, members)
+
+        gm._recompute_all_tree_peer_relations()
 
         gm.recompute_auto_macros()
 

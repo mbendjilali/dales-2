@@ -4,7 +4,15 @@ import glob
 from typing import List, Dict, Any, Optional, Set, Tuple
 import numpy as np
 from scipy.spatial import Delaunay
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Point, Polygon
+
+from backend.core.graph_edges import (
+    upsert_unified_edge,
+    ensure_edges_list,
+    to_frontend_group_relations,
+    PROXIMITY_EDGE_CLASSES,
+    conductor_pole_ids_from_edges,
+)
 
 GROUP_TYPES = ("trees", "buildings", "vehicles", "poles", "conductors")
 
@@ -13,80 +21,23 @@ RELATION_MEMBER_TYPES = ("tree", "building", "vehicle")
 ADJACENT_DIST_MAX = {
     "building": 1.0,
     "vehicle": 0.25,
-    "tree": 0.25,
+    "tree": 0.05,
 }
 
 NEAR_DIST_MAX = {
-    "building": 15.0,
-    "vehicle": 8.0,
-    "tree": 20.0,
+    "building": 20.0,
+    "vehicle": 5.0,
+    "tree": 2.,
 }
+
+# Tree ↔ other elements (gap-only classification; tree distance caps).
+TREE_PEER_TYPES = frozenset({"building", "vehicle", "pole", "conductor"})
+# Tree–peer relations are not scoped to tree clusters; group_id is always this sentinel.
+TREE_PEER_GROUP_ID = 0
 
 
 def _groups_key(object_type: str) -> str:
     return object_type.rstrip("s") + "_groups" if object_type.endswith("s") else object_type + "_groups"
-
-
-def _migrate_legacy_grouped_with(graph_data: Dict[str, Any]) -> None:
-    """One-time migration of legacy 'grouped_with' lists into *_groups + group_id."""
-    for object_type in GROUP_TYPES:
-        objects = graph_data.get(object_type, [])
-        if not objects:
-            continue
-        if any(obj.get("group_id") is not None for obj in objects):
-            for obj in objects:
-                obj.pop("grouped_with", None)
-            continue
-        if not any(isinstance(obj.get("grouped_with"), list) and obj["grouped_with"] for obj in objects):
-            for obj in objects:
-                obj.pop("grouped_with", None)
-            continue
-
-        objects_map = {obj["id"]: obj for obj in objects}
-        visited: Set[int] = set()
-        components: List[Set[int]] = []
-
-        def bfs(start_id: int) -> Set[int]:
-            comp: Set[int] = set()
-            stack = [start_id]
-            while stack:
-                oid = stack.pop()
-                if oid in comp:
-                    continue
-                comp.add(oid)
-                obj = objects_map.get(oid)
-                if not obj:
-                    continue
-                for mid in obj.get("grouped_with") or []:
-                    if mid not in comp:
-                        stack.append(mid)
-            return comp
-
-        for oid, obj in objects_map.items():
-            if oid in visited:
-                continue
-            gw = obj.get("grouped_with") or []
-            if not gw:
-                visited.add(oid)
-                continue
-            comp = bfs(oid)
-            visited.update(comp)
-            components.append(comp)
-
-        groups_key = _groups_key(object_type)
-        graph_data[groups_key] = []
-        groups_list = graph_data[groups_key]
-        next_gid = 1
-        for comp in components:
-            gid = next_gid
-            next_gid += 1
-            members = sorted(comp)
-            groups_list.append({"id": gid, "members": members})
-            for oid in members:
-                objects_map[oid]["group_id"] = gid
-
-        for obj in objects:
-            obj.pop("grouped_with", None)
 
 
 class GraphManager:
@@ -95,7 +46,7 @@ class GraphManager:
         self.current_tile_id: Optional[str] = None
         self.graph_data: Dict[str, Any] = {}
         self.geom_data: Dict[str, Any] = {}
-        # Intra-group relation cache is kept in graph_data["group_relations"].
+        # Proximity relations are stored in graph_data["edges"] (class adjacent/near).
 
     def _get_graph_path(self, tile_id: str) -> str:
         return os.path.join(self.data_dir, "graph", f"graph_{tile_id}.json")
@@ -123,7 +74,7 @@ class GraphManager:
         with open(graph_path, "r") as f:
             self.graph_data = json.load(f)
 
-        _migrate_legacy_grouped_with(self.graph_data)
+        self._normalize_trees_not_clustered()
 
         if os.path.exists(geom_path):
             with open(geom_path, "r") as f:
@@ -132,6 +83,13 @@ class GraphManager:
             self.geom_data = {}
 
         return {"graph": self.graph_data, "geometry": self.geom_data}
+
+    def _normalize_trees_not_clustered(self) -> None:
+        """Trees use no clusters: clear tree_groups / group_id on tree objects."""
+        for t in self.graph_data.get("trees") or []:
+            if isinstance(t, dict):
+                t.pop("group_id", None)
+        self.graph_data["tree_groups"] = []
 
     def save_tile(self, tile_id: str) -> str:
         """
@@ -164,24 +122,40 @@ class GraphManager:
 
         return new_path
 
-    # --- Intra-group relation helpers (adjacent / near) ---
+    # --- Proximity relations (unified edges: adjacent / near) ---
 
-    def _ensure_group_relations(self) -> List[Dict[str, Any]]:
-        """
-        Ensure there is a generic container for per-pair group relations.
-        Each relation has: id, member_type, group_id, a_id, b_id, class.
-        """
-        rels = self.graph_data.get("group_relations")
-        if rels is None:
-            rels = []
-            self.graph_data["group_relations"] = rels
-        return rels
+    def _frontend_relation_for_edge_id(self, eid: int) -> Dict[str, Any]:
+        for r in to_frontend_group_relations(self.graph_data):
+            if int(r.get("id", -1)) == int(eid):
+                return r
+        raise ValueError(f"Relation id {eid} not found")
 
-    def _next_group_relation_id(self) -> int:
-        rels = self.graph_data.get("group_relations", [])
-        if not rels:
-            return 0
-        return max(int(r.get("id", 0)) for r in rels) + 1
+    def _tree_id_set(self) -> Set[int]:
+        out: Set[int] = set()
+        for t in self.graph_data.get("trees") or []:
+            try:
+                out.add(int(t["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    def _normalize_tree_peer_endpoints(
+        self, a_id: int, b_id: int, peer_type: str
+    ) -> Tuple[int, int]:
+        """
+        Return (tree_id, peer_id). Accepts either order on input (undirected edge).
+        """
+        pt = str(peer_type).lower()
+        trees = self._tree_id_set()
+        ai, bi = int(a_id), int(b_id)
+        if ai in trees and bi not in trees:
+            return ai, bi
+        if bi in trees and ai not in trees:
+            return bi, ai
+        raise ValueError(
+            "tree-peer relation requires exactly one tree id and one peer id "
+            f"(peer_type={peer_type!r}, a_id={a_id}, b_id={b_id})"
+        )
 
     def list_group_relations(
         self,
@@ -189,16 +163,13 @@ class GraphManager:
         group_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        List stored per-pair group relations, optionally filtered by member_type and/or group_id.
+        List per-pair proximity relations (API view), optionally filtered.
         """
-        rels = self.graph_data.get("group_relations", [])
-        out: List[Dict[str, Any]] = []
-        for r in rels:
-            if member_type is not None and r.get("member_type") != member_type:
-                continue
-            if group_id is not None and int(r.get("group_id", -1)) != int(group_id):
-                continue
-            out.append(r)
+        out = to_frontend_group_relations(self.graph_data)
+        if member_type is not None:
+            out = [r for r in out if r.get("member_type") == member_type]
+        if group_id is not None:
+            out = [r for r in out if int(r.get("group_id", -1)) == int(group_id)]
         return out
 
     def upsert_group_relation(
@@ -208,49 +179,49 @@ class GraphManager:
         a_id: int,
         b_id: int,
         rel_class: str,
+        peer_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Create or update a relation between two members inside a group.
-        Endpoints are stored in sorted order so (a,b) and (b,a) map to the same entry.
+        Create or update a proximity edge (stored in graph_data[\"edges\"]).
+        Same-type: canonical (a_type, a_id, b_type, b_id). Tree–peer: peer_type required; group_id ignored.
         """
         if member_type not in RELATION_MEMBER_TYPES:
             raise ValueError(f"Relations not supported for member_type={member_type}")
 
-        rels = self._ensure_group_relations()
-        a_ord, b_ord = sorted((int(a_id), int(b_id)))
-        gid = int(group_id)
-
-        for r in rels:
-            if (
-                r.get("member_type") == member_type
-                and int(r.get("group_id", -1)) == gid
-                and int(r.get("a_id", -1)) == a_ord
-                and int(r.get("b_id", -1)) == b_ord
-            ):
-                r["class"] = rel_class
-                return r
-
-        rid = self._next_group_relation_id()
-        rel = {
-            "id": rid,
-            "member_type": member_type,
-            "group_id": gid,
-            "a_id": a_ord,
-            "b_id": b_ord,
-            "class": rel_class,
-        }
-        rels.append(rel)
-        return rel
+        ensure_edges_list(self.graph_data)
+        if peer_type is not None:
+            if member_type != "tree":
+                raise ValueError("peer_type is only valid for member_type=tree")
+            pt = str(peer_type).lower()
+            if pt not in TREE_PEER_TYPES:
+                raise ValueError(f"Invalid peer_type={peer_type!r}")
+            tree_id, peer_id = self._normalize_tree_peer_endpoints(int(a_id), int(b_id), pt)
+            e = upsert_unified_edge(
+                self.graph_data, "tree", tree_id, pt, peer_id, rel_class
+            )
+        else:
+            a_ord, b_ord = sorted((int(a_id), int(b_id)))
+            e = upsert_unified_edge(
+                self.graph_data,
+                member_type,
+                a_ord,
+                member_type,
+                b_ord,
+                rel_class,
+            )
+        return self._frontend_relation_for_edge_id(int(e["id"]))
 
     def update_group_relation(self, rel_id: int, fields: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Update a single relation by id (used by API editing).
-        """
-        rels = self._ensure_group_relations()
-        for r in rels:
-            if int(r.get("id", -1)) == int(rel_id):
-                r.update(fields)
-                return r
+        """Update a single unified edge by id."""
+        eid = int(rel_id)
+        for e in self.graph_data.get("edges") or []:
+            if int(e.get("id", -1)) != eid:
+                continue
+            if "class" in fields:
+                e["class"] = str(fields["class"]).lower()
+            if "cls" in fields:
+                e["class"] = str(fields["cls"]).lower()
+            return self._frontend_relation_for_edge_id(eid)
         raise ValueError(f"Group relation {rel_id} not found")
 
     def delete_group_relations_for_group(
@@ -259,32 +230,57 @@ class GraphManager:
         group_id: int,
         member_ids: Optional[Set[int]] = None,
     ) -> None:
-        """
-        Remove relations that belong to a group and (optionally) involve any of member_ids.
-        Used by ungroup/split operations.
-        """
-        if "group_relations" not in self.graph_data:
-            return
+        """Remove proximity edges for a group."""
         gid = int(group_id)
         members = {int(m) for m in (member_ids or set())}
-        new_rels: List[Dict[str, Any]] = []
-        for r in self.graph_data.get("group_relations", []):
-            if r.get("member_type") != member_type:
-                new_rels.append(r)
+        groups_key = {
+            "building": "building_groups",
+            "vehicle": "vehicle_groups",
+            "tree": "tree_groups",
+        }.get(member_type)
+        group_member_set: Set[int] = set()
+        if groups_key:
+            for g in self.graph_data.get(groups_key, []) or []:
+                if int(g.get("id", -1)) == gid:
+                    group_member_set = {int(x) for x in (g.get("members") or [])}
+                    break
+
+        edges = self.graph_data.get("edges") or []
+        new_edges: List[Dict[str, Any]] = []
+        for e in edges:
+            cls_e = str(e.get("class", "")).lower()
+            if cls_e not in PROXIMITY_EDGE_CLASSES:
+                new_edges.append(e)
                 continue
-            if int(r.get("group_id", -1)) != gid:
-                new_rels.append(r)
+            at = str(e.get("a_type", "")).lower()
+            bt = str(e.get("b_type", "")).lower()
+            aid, bid = int(e.get("a_id", -1)), int(e.get("b_id", -1))
+
+            if member_type == "tree" and ((at == "tree") ^ (bt == "tree")):
+                if gid != TREE_PEER_GROUP_ID:
+                    new_edges.append(e)
+                    continue
+                tid = aid if at == "tree" else bid
+                if not members:
+                    continue
+                if tid in members:
+                    continue
+                new_edges.append(e)
                 continue
-            if not members:
-                # delete all relations for this group
+
+            if at == bt == member_type:
+                if len(group_member_set) < 2 or aid not in group_member_set or bid not in group_member_set:
+                    new_edges.append(e)
+                    continue
+                if not members:
+                    continue
+                if aid in members or bid in members:
+                    continue
+                new_edges.append(e)
                 continue
-            a_id = int(r.get("a_id", -1))
-            b_id = int(r.get("b_id", -1))
-            if a_id in members or b_id in members:
-                # drop this relation
-                continue
-            new_rels.append(r)
-        self.graph_data["group_relations"] = new_rels
+
+            new_edges.append(e)
+        self.graph_data["edges"] = new_edges
 
     # --- Geometry helpers for relation classification ---
 
@@ -403,6 +399,172 @@ class GraphManager:
 
         return max(gap_x, gap_y)
 
+    def _tree_geom_polygon(self, tree_geom: Dict[str, Any]) -> Optional[Polygon]:
+        """2D footprint for a tree: OBB footprint, else AABB from min/max, else buffered crown."""
+        obb = tree_geom.get("obb")
+        if obb and obb.get("footprint"):
+            try:
+                return Polygon(obb["footprint"])
+            except Exception:
+                pass
+        min_a = tree_geom.get("min")
+        max_a = tree_geom.get("max")
+        if (
+            isinstance(min_a, list)
+            and isinstance(max_a, list)
+            and len(min_a) >= 2
+            and len(max_a) >= 2
+        ):
+            try:
+                return Polygon(
+                    [
+                        (float(min_a[0]), float(min_a[1])),
+                        (float(max_a[0]), float(min_a[1])),
+                        (float(max_a[0]), float(max_a[1])),
+                        (float(min_a[0]), float(max_a[1])),
+                    ]
+                )
+            except Exception:
+                pass
+        x, y = tree_geom.get("X"), tree_geom.get("Y")
+        if x is None or y is None:
+            return None
+        r = float(tree_geom.get("crown_radius", 0.5))
+        return Point(float(x), float(y)).buffer(max(r, 0.25))
+
+    def _cross_type_shape_gap(self, tree_id: int, peer_type: str, peer_id: int) -> Optional[float]:
+        """Minimum 2D distance from tree footprint to peer geometry."""
+        tree_geom = self.geom_data.get("trees", {}).get(str(tree_id), {})
+        poly_t = self._tree_geom_polygon(tree_geom)
+        if poly_t is None:
+            return None
+        pt = str(peer_type).lower()
+
+        if pt == "building":
+            g = self.geom_data.get("buildings", {}).get(str(peer_id), {})
+            return self._polygon_gap_poly_to_poly(poly_t, g)
+        if pt == "vehicle":
+            g = self.geom_data.get("vehicles", {}).get(str(peer_id), {})
+            return self._polygon_gap_poly_to_poly(poly_t, g)
+        if pt == "pole":
+            g = self.geom_data.get("poles", {}).get(str(peer_id), {})
+            return self._polygon_gap_poly_to_pole(poly_t, g)
+        if pt == "conductor":
+            ep_map = self._conductor_endpoint_id_to_geom_key()
+            key = ep_map.get(int(peer_id))
+            if not key:
+                return None
+            cg = self.geom_data.get("conductors", {}).get(key, {})
+            return self._polygon_gap_poly_to_conductor(poly_t, cg)
+        return None
+
+    def _polygon_gap_poly_to_poly(self, poly_t: Polygon, geom: Dict[str, Any]) -> Optional[float]:
+        obb = geom.get("obb")
+        if obb and obb.get("footprint"):
+            try:
+                poly_b = Polygon(obb["footprint"])
+                return float(poly_t.distance(poly_b))
+            except Exception:
+                pass
+        min_b = geom.get("min")
+        max_b = geom.get("max")
+        if not (
+            isinstance(min_b, list)
+            and isinstance(max_b, list)
+            and len(min_b) >= 2
+            and len(max_b) >= 2
+        ):
+            return None
+        try:
+            poly_b = Polygon(
+                [
+                    (float(min_b[0]), float(min_b[1])),
+                    (float(max_b[0]), float(min_b[1])),
+                    (float(max_b[0]), float(max_b[1])),
+                    (float(min_b[0]), float(max_b[1])),
+                ]
+            )
+            return float(poly_t.distance(poly_b))
+        except Exception:
+            return None
+
+    def _polygon_gap_poly_to_pole(self, poly_t: Polygon, geom: Dict[str, Any]) -> Optional[float]:
+        fp = geom.get("footprint")
+        if fp:
+            try:
+                return float(poly_t.distance(Polygon(fp)))
+            except Exception:
+                pass
+        x, y = geom.get("X"), geom.get("Y")
+        if x is None or y is None:
+            return None
+        return float(poly_t.distance(Point(float(x), float(y))))
+
+    def _polygon_gap_poly_to_conductor(self, poly_t: Polygon, cg: Dict[str, Any]) -> Optional[float]:
+        sp, ep = cg.get("startpoint"), cg.get("endpoint")
+        if not sp or not ep:
+            return None
+        try:
+            ax, ay = float(sp[0]), float(sp[1])
+            bx, by = float(ep[0]), float(ep[1])
+            line = LineString([(ax, ay), (bx, by)])
+            return float(poly_t.distance(line))
+        except Exception:
+            return None
+
+    def _conductor_endpoint_id_to_geom_key(self) -> Dict[int, str]:
+        """Map conductor instance_id to geometry key link_idx_conductor_id."""
+        out: Dict[int, str] = {}
+        for c in self.graph_data.get("conductors") or []:
+            li = c.get("link_idx")
+            cid = c.get("conductor_id")
+            inst = c.get("instance_id")
+            if li is None or cid is None or inst is None:
+                continue
+            try:
+                out[int(inst)] = f"{li}_{cid}"
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _recompute_all_tree_peer_relations(self) -> None:
+        """Adjacent / near between each tree and all buildings, vehicles, poles, conductors (gap-only, undirected)."""
+        tree_ids = [int(t["id"]) for t in self.graph_data.get("trees") or [] if t.get("id") is not None]
+        if not tree_ids:
+            return
+        adj_max = float(ADJACENT_DIST_MAX.get("tree", 0.0))
+        near_max = float(NEAR_DIST_MAX.get("tree", 0.0))
+
+        peers: List[Tuple[str, int]] = []
+        for b in self.graph_data.get("buildings") or []:
+            peers.append(("building", int(b["id"])))
+        for v in self.graph_data.get("vehicles") or []:
+            peers.append(("vehicle", int(v["id"])))
+        for p in self.graph_data.get("poles") or []:
+            peers.append(("pole", int(p["id"])))
+        for c in self.graph_data.get("conductors") or []:
+            inst = c.get("instance_id")
+            if inst is None:
+                continue
+            try:
+                peers.append(("conductor", int(inst)))
+            except (TypeError, ValueError):
+                continue
+
+        for tid in tree_ids:
+            for pt, pid in peers:
+                gap = self._cross_type_shape_gap(tid, pt, pid)
+                if gap is None:
+                    continue
+                if gap <= adj_max:
+                    self.upsert_group_relation(
+                        "tree", TREE_PEER_GROUP_ID, tid, pid, "adjacent", peer_type=pt
+                    )
+                elif gap <= near_max:
+                    self.upsert_group_relation(
+                        "tree", TREE_PEER_GROUP_ID, tid, pid, "near", peer_type=pt
+                    )
+
     def _delaunay_edges(self, centroids: Dict[int, Tuple[float, float]]) -> Set[Tuple[int, int]]:
         """Return unique undirected edges from a 2D Delaunay triangulation of centroids."""
         ids = list(centroids.keys())
@@ -514,7 +676,7 @@ class GraphManager:
         self._sync_macro_instances_from_toplevel()
 
     def _sync_macro_instances_from_toplevel(self) -> None:
-        """Populate macro_instances from connector_spans + electrical_grids for API compat."""
+        """Populate macro_instances from connector_spans + electrical_grids."""
         macros: List[Dict[str, Any]] = []
         mid = 0
         for span in self.graph_data.get("connector_spans", []):
@@ -552,14 +714,20 @@ class GraphManager:
         span_key_to_conductors: Dict[Tuple[int, int], List[str]] = {}
 
         for c in conductors:
-            poles = list({int(pid) for pid in c.get("poles", []) if pid is not None})
+            inst = c.get("instance_id")
+            if inst is None:
+                continue
+            ep = int(inst)
+            poles = list(
+                {int(pid) for pid in conductor_pole_ids_from_edges(self.graph_data, ep) if pid is not None}
+            )
             if len(poles) < 2:
                 continue
             poles.sort()
             a, b = poles[0], poles[-1]
             key = (a, b)
-            uid_str = f"{c.get('link_idx')}_{c.get('conductor_id')}"
-            span_key_to_conductors.setdefault(key, []).append(uid_str)
+            cond_key = str(ep)
+            span_key_to_conductors.setdefault(key, []).append(cond_key)
 
         spans: List[Dict[str, Any]] = []
         span_idx_by_key: Dict[Tuple[int, int], int] = {}
@@ -713,10 +881,6 @@ class GraphManager:
         if not member_type:
             return
 
-        for r in self.graph_data.get("group_relations", []):
-            if r.get("member_type") == member_type and int(r.get("group_id", -1)) in touched_gids:
-                r["group_id"] = new_gid
-
         cross_pairs: Set[Tuple[int, int]] = set()
         sets_list = list(old_member_sets.values())
         ungrouped = set(target_ids) - set().union(*sets_list) if sets_list else set(target_ids)
@@ -729,7 +893,7 @@ class GraphManager:
                     for b in s2:
                         cross_pairs.add((min(a, b), max(a, b)))
 
-        if cross_pairs:
+        if cross_pairs and member_type != "tree":
             self._recompute_relations_for_pairs(member_type, new_gid, members, cross_pairs)
 
     def _split_groups(
@@ -775,30 +939,29 @@ class GraphManager:
                 objects_map[oid]["group_id"] = new_gid
 
         if member_type and removed_ids_by_gid:
-            existing_rels = list(self.graph_data.get("group_relations", []))
-            new_rels: List[Dict[str, Any]] = []
-            for r in existing_rels:
-                if r.get("member_type") != member_type:
-                    new_rels.append(r)
+            edges = self.graph_data.get("edges") or []
+            new_edges: List[Dict[str, Any]] = []
+            for e in edges:
+                cls_e = str(e.get("class", "")).lower()
+                if cls_e not in PROXIMITY_EDGE_CLASSES:
+                    new_edges.append(e)
                     continue
-                rgid = int(r.get("group_id", -1))
-                a_id = int(r.get("a_id", -1))
-                b_id = int(r.get("b_id", -1))
-                removed_ids = removed_ids_by_gid.get(rgid)
-                if not removed_ids:
-                    new_rels.append(r)
+                at = str(e.get("a_type", "")).lower()
+                bt = str(e.get("b_type", "")).lower()
+                if at != member_type or bt != member_type:
+                    new_edges.append(e)
                     continue
-                in_a = a_id in removed_ids
-                in_b = b_id in removed_ids
-                if in_a and in_b:
-                    if new_gid is not None:
-                        r["group_id"] = new_gid
-                        new_rels.append(r)
-                elif in_a or in_b:
-                    continue
-                else:
-                    new_rels.append(r)
-            self.graph_data["group_relations"] = new_rels
+                aid, bid = int(e.get("a_id", -1)), int(e.get("b_id", -1))
+                drop = False
+                for removed_ids in removed_ids_by_gid.values():
+                    ia = aid in removed_ids
+                    ib = bid in removed_ids
+                    if ia ^ ib:
+                        drop = True
+                        break
+                if not drop:
+                    new_edges.append(e)
+            self.graph_data["edges"] = new_edges
 
     def _delete_from_groups(
         self,
@@ -825,11 +988,27 @@ class GraphManager:
             objects_map[oid].pop("group_id", None)
 
         if member_type:
-            self.graph_data["group_relations"] = [
-                r for r in self.graph_data.get("group_relations", [])
-                if not (
-                    r.get("member_type") == member_type
-                    and (int(r.get("a_id", -1)) in target_set or int(r.get("b_id", -1)) in target_set)
-                )
-            ]
+            edges = self.graph_data.get("edges") or []
+            new_edges: List[Dict[str, Any]] = []
+            for e in edges:
+                cls_e = str(e.get("class", "")).lower()
+                if cls_e not in PROXIMITY_EDGE_CLASSES:
+                    new_edges.append(e)
+                    continue
+                at = str(e.get("a_type", "")).lower()
+                bt = str(e.get("b_type", "")).lower()
+                aid, bid = int(e.get("a_id", -1)), int(e.get("b_id", -1))
+                if member_type == "tree":
+                    if at == "tree" and aid in target_set:
+                        continue
+                    if bt == "tree" and bid in target_set:
+                        continue
+                    new_edges.append(e)
+                elif at == bt == member_type:
+                    if aid in target_set or bid in target_set:
+                        continue
+                    new_edges.append(e)
+                else:
+                    new_edges.append(e)
+            self.graph_data["edges"] = new_edges
 

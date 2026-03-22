@@ -2,6 +2,12 @@ import numpy as np
 import colorsys
 from typing import List, Dict, Any, Set
 
+from backend.core.graph_edges import (
+    to_frontend_group_relations,
+    conductor_pole_ids_from_edges,
+    conductor_support_building_ids_from_edges,
+)
+
 
 def generate_conductor_curve(conductor: Dict, steps: int = 20) -> List[List[float]]:
     model = conductor.get('model', {})
@@ -154,8 +160,8 @@ def build_scene_data(graph_data: Dict[str, Any], geom_data: Dict[str, Any]) -> D
 
     # 3. Process conductors
     js_conductors: List[Dict[str, Any]] = []
-    comp_id_to_uids: Dict[int, List[str]] = {}
-    numeric_to_str_uid: Dict[int, str] = {}
+    comp_id_to_scene_ids: Dict[int, List[str]] = {}
+    conductor_edge_id_to_scene_id: Dict[int, str] = {}
 
     conductors = graph_data.get('conductors', [])
     c_geoms = geom_data.get('conductors', {})
@@ -164,58 +170,67 @@ def build_scene_data(graph_data: Dict[str, Any], geom_data: Dict[str, Any]) -> D
         max_comp = 1
 
     for c in conductors:
-        uid_str = f"{c['link_idx']}_{c['conductor_id']}"
-        geom = c_geoms.get(uid_str, {})
+        geom_key = f"{c['link_idx']}_{c['conductor_id']}"
+        iid = c["instance_id"]
+        scene_id = str(int(iid))
+        geom = c_geoms.get(geom_key, {})
         for key in ["model", "startpoint", "endpoint"]:
             c[key] = geom.get(key)
         points = generate_conductor_curve(c, steps=20)
         comp_idx = c.get('component', 0)
         color = get_distinct_color(index=comp_idx, total=max_comp)
-        js_conductors.append({'points': points, 'color': color, 'id': uid_str, 'component': comp_idx})
-        comp_id_to_uids.setdefault(comp_idx, []).append(uid_str)
-        if 'uid' in c:
-            numeric_to_str_uid[c['uid']] = uid_str
+        js_conductors.append({
+            'points': points,
+            'color': color,
+            'id': scene_id,
+            'component': comp_idx,
+        })
+        comp_id_to_scene_ids.setdefault(comp_idx, []).append(scene_id)
+        conductor_edge_id_to_scene_id[int(iid)] = scene_id
 
-    extension_groups = list(comp_id_to_uids.values())
+    extension_groups = list(comp_id_to_scene_ids.values())
 
-    # 4. Relationship maps
+    conductor_extensions_js: Dict[str, List[str]] = {}
     bifurcation_map_js: Dict[str, List[str]] = {}
     crosses_map_js: Dict[str, List[str]] = {}
-    bifurcations_list = graph_data.get('bifurcations', [])
-    crosses_list = graph_data.get('crosses', [])
 
-    for c in conductors:
-        if 'uid' not in c:
+    def _add_cond_pair(m: Dict[str, List[str]], sa: str, sb: str) -> None:
+        if sa == sb:
+            return
+        m.setdefault(sa, []).append(sb)
+        m.setdefault(sb, []).append(sa)
+
+    for e in graph_data.get("edges") or []:
+        cls = str(e.get("class", "")).lower()
+        if cls not in ("extension", "bifurcation", "cross"):
             continue
-        numeric_uid = c['uid']
-        uid_str = numeric_to_str_uid.get(numeric_uid)
-        if uid_str is None:
+        at = str(e.get("a_type", "")).lower()
+        bt = str(e.get("b_type", "")).lower()
+        if at != "conductor" or bt != "conductor":
             continue
-        if numeric_uid < len(bifurcations_list):
-            bif_indices = bifurcations_list[numeric_uid] or []
-            if bif_indices:
-                bifurcation_map_js[uid_str] = [
-                    numeric_to_str_uid.get(graph_data['conductors'][idx]['uid'])
-                    for idx in bif_indices
-                    if idx < len(graph_data['conductors']) and
-                    graph_data['conductors'][idx].get('uid') in numeric_to_str_uid
-                ]
-        if numeric_uid < len(crosses_list):
-            cross_indices = crosses_list[numeric_uid] or []
-            if cross_indices:
-                crosses_map_js[uid_str] = [
-                    numeric_to_str_uid.get(graph_data['conductors'][idx]['uid'])
-                    for idx in cross_indices
-                    if idx < len(graph_data['conductors']) and
-                    graph_data['conductors'][idx].get('uid') in numeric_to_str_uid
-                ]
+        try:
+            ua, ub = int(e["a_id"]), int(e["b_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        sa, sb = conductor_edge_id_to_scene_id.get(ua), conductor_edge_id_to_scene_id.get(ub)
+        if not sa or not sb:
+            continue
+        if cls == "extension":
+            _add_cond_pair(conductor_extensions_js, sa, sb)
+        elif cls == "bifurcation":
+            _add_cond_pair(bifurcation_map_js, sa, sb)
+        else:
+            _add_cond_pair(crosses_map_js, sa, sb)
 
     support_pole_map: Dict[str, List[int]] = {}
     support_building_map: Dict[str, List[int]] = {}
     for c in conductors:
-        uid_str = f"{c['link_idx']}_{c['conductor_id']}"
-        support_pole_map[uid_str] = c.get('poles', [])
-        support_building_map[uid_str] = c.get('support_buildings', [])
+        iid = int(c["instance_id"])
+        scene_id = str(iid)
+        support_pole_map[scene_id] = conductor_pole_ids_from_edges(graph_data, iid)
+        support_building_map[scene_id] = conductor_support_building_ids_from_edges(
+            graph_data, iid
+        )
 
     ground_pole_ids: Set[int] = set()
     for pole in graph_data.get('poles', []):
@@ -224,20 +239,20 @@ def build_scene_data(graph_data: Dict[str, Any], geom_data: Dict[str, Any]) -> D
             ground_pole_ids.add(int(pid))
 
     support_ground_map: Dict[str, List[int]] = {}
-    for uid_str, pole_ids in support_pole_map.items():
+    for cond_scene_id, pole_ids in support_pole_map.items():
         for pid in pole_ids:
             if int(pid) in ground_pole_ids:
-                support_ground_map.setdefault(uid_str, []).append(int(pid))
+                support_ground_map.setdefault(cond_scene_id, []).append(int(pid))
 
     pole_to_conductors: Dict[int, List[str]] = {}
-    for uid_str, pole_ids in support_pole_map.items():
+    for cond_scene_id, pole_ids in support_pole_map.items():
         for pid in pole_ids:
-            pole_to_conductors.setdefault(pid, []).append(uid_str)
+            pole_to_conductors.setdefault(pid, []).append(cond_scene_id)
 
     building_to_support_conductors: Dict[int, List[str]] = {}
-    for uid_str, building_ids in support_building_map.items():
+    for cond_scene_id, building_ids in support_building_map.items():
         for bid in building_ids:
-            building_to_support_conductors.setdefault(bid, []).append(uid_str)
+            building_to_support_conductors.setdefault(bid, []).append(cond_scene_id)
 
     BUILDING_COLOR_NONE = 0x888888
     BUILDING_COLOR_SUPPORT = 0x1565c0
@@ -255,6 +270,7 @@ def build_scene_data(graph_data: Dict[str, Any], geom_data: Dict[str, Any]) -> D
         'conductors': js_conductors,
         'conductorRadius': 0.1,
         'extensionGroups': extension_groups,
+        'conductorExtensions': conductor_extensions_js,
         'bifurcations': bifurcation_map_js,
         'crosses': crosses_map_js,
         'supportPoles': support_pole_map,
@@ -270,5 +286,5 @@ def build_scene_data(graph_data: Dict[str, Any], geom_data: Dict[str, Any]) -> D
         'buildingGroups': graph_data.get('building_groups', []),
         'vehicleGroups': graph_data.get('vehicle_groups', []),
         'treeGroups': graph_data.get('tree_groups', []),
-        'groupRelations': graph_data.get('group_relations', []),
+        'groupRelations': to_frontend_group_relations(graph_data),
     }

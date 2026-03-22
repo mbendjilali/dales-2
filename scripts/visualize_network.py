@@ -10,6 +10,14 @@ from typing import List, Dict, Any, Optional
 
 import laspy
 
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from backend.core.graph_edges import (
+    conductor_pole_ids_from_edges,
+    conductor_support_building_ids_from_edges,
+)
 from pipeline.lib.generate_json_graph import build_instance_graph
 from pipeline.lib.find_supports import get_node_attachments, reconstruct_footprints
 
@@ -191,8 +199,8 @@ def visualize_network_web(
         # build_instance_graph uses data['nodes']. 
         # We should update data['nodes'] with reconstructed ones.
         data['nodes'] = nodes
-        graph_data = build_instance_graph(data, tolerance=tolerance)
-        
+        graph_data, _geom_unused = build_instance_graph(data, tolerance=tolerance)
+
         # Save the graph byproduct
         base = os.path.basename(json_file)
         if base.lower().endswith(".json"):
@@ -273,99 +281,81 @@ def visualize_network_web(
     bifurcation_map_js = {}
     crosses_map_js = {}
     
-    # Mapping for component highlighting
-    comp_id_to_uids = {}
-    
-    # Mapping for support and proximity
-    support_pole_map = {}
-    support_building_map = {}
-    proximity_map = {}
+    comp_id_to_scene_ids: Dict[int, List[str]] = {}
+    support_pole_map: Dict[str, List[int]] = {}
+    support_building_map: Dict[str, List[int]] = {}
+    proximity_map: Dict[str, List[Any]] = {}
+    conductor_edge_id_to_scene_id: Dict[int, str] = {}
 
-    # Extract proximity from graph_data['proximity'] if available
-    proximity_list = graph_data.get('proximity', [])
-    # Convert list of {conductor_uid, building_id} to map {conductor_uid_str: [building_id...]}
-    # Need to match conductor numeric uid to string uid
-    
-    # Helper to map numeric uid to string uid
-    numeric_to_str_uid = {}
-    
-    for c in graph_data['conductors']:
-        uid_str = f"{c['link_idx']}_{c['conductor_id']}"
-        numeric_to_str_uid[c['uid']] = uid_str
-        
+    for c in graph_data.get("conductors") or []:
+        iid = c.get("instance_id")
+        if iid is None:
+            continue
+        scene_id = str(int(iid))
+        conductor_edge_id_to_scene_id[int(iid)] = scene_id
+
         points = generate_conductor_curve(c, steps=20)
-        
-        # Color based on component
-        comp_idx = c.get('component', 0)
-        color = get_distinct_color(index=comp_idx, total=max(len(set(c.get('component', 0) for c in graph_data['conductors'])), 1))
-        
-        js_conductors.append({
-            'points': points,
-            'color': color,
-            'id': uid_str
-        })
-        
-        # Extension groups for highlighting
-        comp_id_to_uids.setdefault(comp_idx, []).append(uid_str)
-        
-        # Support info
-        # Poles
-        s_poles = c.get('poles', [])
-        # We need to store pole IDs.
-        # But wait, c['poles'] contains pole IDs (integers).
-        support_pole_map[uid_str] = s_poles
-        
-        # Buildings
-        s_builds = c.get('support_buildings', [])
-        support_building_map[uid_str] = s_builds
+        comp_idx = c.get("component", 0)
+        color = get_distinct_color(
+            index=comp_idx,
+            total=max(
+                len(set(x.get("component", 0) for x in (graph_data.get("conductors") or []))),
+                1,
+            ),
+        )
+        js_conductors.append(
+            {
+                "points": points,
+                "color": color,
+                "id": scene_id,
+            }
+        )
+        comp_id_to_scene_ids.setdefault(comp_idx, []).append(scene_id)
+        support_pole_map[scene_id] = conductor_pole_ids_from_edges(graph_data, int(iid))
+        support_building_map[scene_id] = conductor_support_building_ids_from_edges(
+            graph_data, int(iid)
+        )
 
-    # Populate proximity map
-    for item in proximity_list:
-        c_uid_num = item.get('conductor_uid')
-        b_id = item.get('building_id')
-        if c_uid_num in numeric_to_str_uid:
-            c_uid_str = numeric_to_str_uid[c_uid_num]
-            proximity_map.setdefault(c_uid_str, []).append(b_id)
+    def _add_cond_rel(m: Dict[str, List[str]], sa: str, sb: str) -> None:
+        if sa == sb:
+            return
+        m.setdefault(sa, []).append(sb)
+        m.setdefault(sb, []).append(sa)
 
-    # Relationships from graph_data (numeric UIDs to string UIDs)
-    for c in graph_data['conductors']:
-        uid_str = f"{c['link_idx']}_{c['conductor_id']}"
-        numeric_uid = c['uid']
-        
-        # Bifurcations
-        # graph_data['bifurcations'] is list of lists
-        if numeric_uid < len(graph_data['bifurcations']):
-            bif_indices = graph_data['bifurcations'][numeric_uid]
-            if bif_indices:
-                bifurcation_map_js[uid_str] = [
-                    f"{graph_data['conductors'][idx]['link_idx']}_{graph_data['conductors'][idx]['conductor_id']}" 
-                    for idx in bif_indices
-                ]
-            
-        # Crosses
-        if numeric_uid < len(graph_data['crosses']):
-            cross_indices = graph_data['crosses'][numeric_uid]
-            if cross_indices:
-                crosses_map_js[uid_str] = [
-                    f"{graph_data['conductors'][idx]['link_idx']}_{graph_data['conductors'][idx]['conductor_id']}" 
-                    for idx in cross_indices
-                ]
+    for e in graph_data.get("edges") or []:
+        cls = str(e.get("class", "")).lower()
+        if cls not in ("bifurcation", "cross"):
+            continue
+        at = str(e.get("a_type", "")).lower()
+        bt = str(e.get("b_type", "")).lower()
+        if at != "conductor" or bt != "conductor":
+            continue
+        try:
+            ua, ub = int(e["a_id"]), int(e["b_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        sa, sb = conductor_edge_id_to_scene_id.get(ua), conductor_edge_id_to_scene_id.get(ub)
+        if not sa or not sb:
+            continue
+        if cls == "bifurcation":
+            _add_cond_rel(bifurcation_map_js, sa, sb)
+        else:
+            _add_cond_rel(crosses_map_js, sa, sb)
 
-    extension_groups = list(comp_id_to_uids.values())
+    extension_groups = list(comp_id_to_scene_ids.values())
 
-    # Inverse maps for pole/building info panels: object id -> list of conductor uid strings
-    pole_to_conductors = {}
-    for uid_str, pole_ids in support_pole_map.items():
+    pole_to_conductors: Dict[int, List[str]] = {}
+    for cond_id, pole_ids in support_pole_map.items():
         for pid in pole_ids:
-            pole_to_conductors.setdefault(pid, []).append(uid_str)
-    building_to_support_conductors = {}
-    for uid_str, building_ids in support_building_map.items():
+            pole_to_conductors.setdefault(pid, []).append(cond_id)
+    building_to_support_conductors: Dict[int, List[str]] = {}
+    for cond_id, building_ids in support_building_map.items():
         for bid in building_ids:
-            building_to_support_conductors.setdefault(bid, []).append(uid_str)
-    building_to_proximity_conductors = {}
-    for uid_str, building_ids in proximity_map.items():
+            building_to_support_conductors.setdefault(bid, []).append(cond_id)
+    building_to_proximity_conductors: Dict[int, List[str]] = {}
+    for cond_id, building_ids in proximity_map.items():
         for bid in building_ids:
-            building_to_proximity_conductors.setdefault(bid, []).append(uid_str)
+            building_to_proximity_conductors.setdefault(bid, []).append(cond_id)
 
     # Default colors for buildings: gray if uninvolved, distinct colors for support vs proximity
     BUILDING_COLOR_NONE = 0x888888
@@ -387,15 +377,7 @@ def visualize_network_web(
             building_default_colors[bid] = BUILDING_COLOR_NONE
             building_default_opacity[bid] = 0.3
 
-    # Optional tree proximity: list of {conductor_uid, tree_id}
-    tree_proximity_list = graph_data.get('tree_proximity', [])
     tree_prox_map: Dict[str, List[int]] = {}
-    for item in tree_proximity_list:
-        c_uid_num = item.get('conductor_uid')
-        t_id = item.get('tree_id')
-        if c_uid_num in numeric_to_str_uid and t_id is not None:
-            c_uid_str = numeric_to_str_uid[c_uid_num]
-            tree_prox_map.setdefault(c_uid_str, []).append(int(t_id))
 
     scene_data = {
         'poles': js_poles,
@@ -408,6 +390,8 @@ def visualize_network_web(
         'buildings': graph_data.get('buildings', []),
         'vehicles': graph_data.get('vehicles', []),
         'trees': graph_data.get('trees', []),
+        'buildingGroups': graph_data.get('building_groups', []),
+        'vehicleGroups': graph_data.get('vehicle_groups', []),
         'vehicleDefaultColors': graph_data.get('vehicleDefaultColors', {}),
         'supportPoles': support_pole_map,
         'supportBuildings': support_building_map,
@@ -591,6 +575,15 @@ def visualize_network_web(
         // INJECTED DATA
         const data = {json.dumps(scene_data)};
 
+        function rowForConductorId(tid) {{
+            const s = String(tid);
+            return (data.conductors || []).find(c => String(c.id) === s) || null;
+        }}
+        function conductorDisplayLabelHtml(tid) {{
+            const row = rowForConductorId(tid);
+            return row ? String(row.id) : String(tid);
+        }}
+
         // Scene Setup
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0xf0f0f0);
@@ -703,7 +696,7 @@ def visualize_network_web(
                     geometry.setIndex(indices);
                     geometry.computeVertexNormals();
                 }} else {{
-                    // Legacy: OBB or AABB box
+                    // OBB or AABB box
                     let center, size, rotation;
                     if (b.obb) {{
                         center = new THREE.Vector3(...b.obb.center);
@@ -1051,15 +1044,16 @@ def visualize_network_web(
                 }}
             }} else if (active.type === 'building') {{
                 const id = active.id;
-                // Find grouped-with building ids from data.buildings
                 const bInfo = (data.buildings || []).find(b => b.id === id) || null;
-                const grouped = bInfo && Array.isArray(bInfo.grouped_with) ? bInfo.grouped_with : [];
+                const bgid = bInfo && bInfo.group_id != null ? bInfo.group_id : null;
+                const bg = bgid != null ? (data.buildingGroups || []).find(g => g.id === bgid) : null;
+                const peers = bg && Array.isArray(bg.members) ? bg.members.filter(m => m !== id) : [];
                 buildingMeshes.forEach(m => {{
                     if (m.userData.id === id) {{
                         m.material.color.setHex(COLOR_SELECTED);
                         m.material.opacity = 0.9;
                         m.children[0].material.color.setHex(COLOR_SELECTED);
-                    }} else if (grouped.includes(m.userData.id)) {{
+                    }} else if (peers.includes(m.userData.id)) {{
                         m.material.color.setHex(COLOR_EXTENSION);
                         m.material.opacity = 0.8;
                         m.children[0].material.color.setHex(COLOR_EXTENSION);
@@ -1068,13 +1062,15 @@ def visualize_network_web(
             }} else if (active.type === 'vehicle') {{
                 const id = active.id;
                 const vInfo = (data.vehicles || []).find(v => v.id === id) || null;
-                const grouped = vInfo && Array.isArray(vInfo.grouped_with) ? vInfo.grouped_with : [];
+                const vgid = vInfo && vInfo.group_id != null ? vInfo.group_id : null;
+                const vg = vgid != null ? (data.vehicleGroups || []).find(g => g.id === vgid) : null;
+                const peers = vg && Array.isArray(vg.members) ? vg.members.filter(m => m !== id) : [];
                 vehicleMeshes.forEach(m => {{
                     if (m.userData.id === id) {{
                         m.material.color.setHex(COLOR_SELECTED);
                         m.material.opacity = 0.9;
                         m.children[0].material.color.setHex(COLOR_SELECTED);
-                    }} else if (grouped.includes(m.userData.id)) {{
+                    }} else if (peers.includes(m.userData.id)) {{
                         m.material.color.setHex(COLOR_EXTENSION);
                         m.material.opacity = 0.8;
                         m.children[0].material.color.setHex(COLOR_EXTENSION);
@@ -1086,18 +1082,8 @@ def visualize_network_web(
                     const baseColor = new THREE.Color(0x228b22);
                     const highlightColor = new THREE.Color(COLOR_SELECTED);
                     const id = active.id;
-                    const tInfo = (data.trees || []).find(t => t.id === id) || null;
-                    const groupIds = new Set();
-                    groupIds.add(id);
-                    if (tInfo && Array.isArray(tInfo.grouped_with)) {{
-                        tInfo.grouped_with.forEach(gid => groupIds.add(gid));
-                    }}
                     ids.forEach((tid, index) => {{
-                        if (groupIds.has(tid)) {{
-                            treeMesh.setColorAt(index, highlightColor);
-                        }} else {{
-                            treeMesh.setColorAt(index, baseColor);
-                        }}
+                        treeMesh.setColorAt(index, tid === id ? highlightColor : baseColor);
                     }});
                     if (treeMesh.instanceColor) {{
                         treeMesh.instanceColor.needsUpdate = true;
@@ -1125,11 +1111,12 @@ def visualize_network_web(
                 const supBuilds = data.supportBuildings[id] || [];
                 const proxBuilds = data.proximityBuildings[id] || [];
                 
+                const disp = conductorDisplayLabelHtml(id);
                 el.innerHTML =
-                    '<b>Conductor: ' + id + '</b><br>' +
+                    '<b>Conductor: ' + disp + '</b><br>' +
                     'Component Size: ' + extGroup.length + '<br>' +
-                    'Bifurcations: ' + bifList.length + '<br>' +
-                    'Crosses: ' + crossList.length + '<br>' +
+                    'Bifurcations: ' + (bifList.length ? bifList.map(conductorDisplayLabelHtml).join(', ') : 'none') + '<br>' +
+                    'Crosses: ' + (crossList.length ? crossList.map(conductorDisplayLabelHtml).join(', ') : 'none') + '<br>' +
                     'Support Poles: ' + supPoles.join(', ') + '<br>' +
                     'Support Buildings: ' + supBuilds.join(', ') + '<br>' +
                     'Proximity Buildings: ' + proxBuilds.join(', ');
@@ -1137,28 +1124,32 @@ def visualize_network_web(
                 const conductors = data.poleToConductors && data.poleToConductors[selection.id] || [];
                 el.innerHTML =
                     '<b>Pole: ' + selection.id + '</b><br>' +
-                    'Connected conductors: ' + (conductors.length ? conductors.join(', ') : 'none');
+                    'Connected conductors: ' + (conductors.length ? conductors.map(conductorDisplayLabelHtml).join(', ') : 'none');
             }} else if (selection.type === 'building') {{
                 const supportConductors = data.buildingToSupportConductors && data.buildingToSupportConductors[selection.id] || [];
                 const proximityConductors = data.buildingToProximityConductors && data.buildingToProximityConductors[selection.id] || [];
                 const bInfo = (data.buildings || []).find(b => b.id === selection.id) || null;
-                const grouped = bInfo && Array.isArray(bInfo.grouped_with) ? bInfo.grouped_with : [];
+                const bgid = bInfo && bInfo.group_id != null ? bInfo.group_id : null;
+                const bg = bgid != null ? (data.buildingGroups || []).find(g => g.id === bgid) : null;
+                const members = bg && Array.isArray(bg.members) ? bg.members.filter(m => m !== selection.id) : [];
                 el.innerHTML =
                     '<b>Building: ' + selection.id + '</b><br>' +
-                    'Support conductors: ' + (supportConductors.length ? supportConductors.join(', ') : 'none') + '<br>' +
-                    'Proximity conductors: ' + (proximityConductors.length ? proximityConductors.join(', ') : 'none') + '<br>' +
-                    'Grouped with: ' + (grouped.length ? grouped.join(', ') : 'none');
+                    'Group id: ' + (bgid != null ? bgid : 'none') + '<br>' +
+                    'Group peers: ' + (members.length ? members.join(', ') : 'none') + '<br>' +
+                    'Support conductors: ' + (supportConductors.length ? supportConductors.map(conductorDisplayLabelHtml).join(', ') : 'none') + '<br>' +
+                    'Proximity conductors: ' + (proximityConductors.length ? proximityConductors.map(conductorDisplayLabelHtml).join(', ') : 'none');
             }} else if (selection.type === 'vehicle') {{
                 const vInfo = (data.vehicles || []).find(v => v.id === selection.id) || null;
-                const grouped = vInfo && Array.isArray(vInfo.grouped_with) ? vInfo.grouped_with : [];
+                const vgid = vInfo && vInfo.group_id != null ? vInfo.group_id : null;
+                const vg = vgid != null ? (data.vehicleGroups || []).find(g => g.id === vgid) : null;
+                const members = vg && Array.isArray(vg.members) ? vg.members.filter(m => m !== selection.id) : [];
                 el.innerHTML =
                     '<b>Vehicle: ' + selection.id + '</b><br>' +
                     'Class: ' + (vInfo ? vInfo.sem_class : 'n/a') + '<br>' +
-                    'Grouped with: ' + (grouped.length ? grouped.join(', ') : 'none');
+                    'Group id: ' + (vgid != null ? vgid : 'none') + '<br>' +
+                    'Group peers: ' + (members.length ? members.join(', ') : 'none');
             }} else if (selection.type === 'tree') {{
                 const tInfo = (data.trees || []).find(t => t.id === selection.id) || null;
-                const grouped = tInfo && Array.isArray(tInfo.grouped_with) ? tInfo.grouped_with : [];
-                // Count nearby trees via grouping and nearby conductors via treeProximity
                 let nearConductors = [];
                 if (data.treeProximity) {{
                     for (const [cid, tids] of Object.entries(data.treeProximity)) {{
@@ -1169,8 +1160,7 @@ def visualize_network_web(
                     '<b>Tree: ' + selection.id + '</b><br>' +
                     'Height: ' + (tInfo ? tInfo.height.toFixed(2) : 'n/a') + ' m<br>' +
                     'Crown radius: ' + (tInfo ? tInfo.crown_radius.toFixed(2) : 'n/a') + ' m<br>' +
-                    'Grouped with: ' + (grouped.length ? grouped.join(', ') : 'none') + '<br>' +
-                    'Near conductors: ' + (nearConductors.length ? nearConductors.join(', ') : 'none');
+                    'Near conductors: ' + (nearConductors.length ? nearConductors.map(conductorDisplayLabelHtml).join(', ') : 'none');
             }}
         }}
 
@@ -1224,7 +1214,9 @@ def visualize_network_web(
         sortedGroups.forEach(item => {{
             const li = document.createElement('li');
             li.id = 'comp-li-' + item.originalIndex;
-            li.innerHTML = `<span>Component ${{item.originalIndex}} (${{item.length}})</span>`;
+            const compLabels = item.group.map(conductorDisplayLabelHtml).join(', ');
+            const compText = compLabels.length > 80 ? compLabels.slice(0, 77) + '…' : compLabels;
+            li.innerHTML = `<span>${{compText}} (${{item.length}})</span>`;
             
             const chk = document.createElement('input');
             chk.type = 'checkbox';

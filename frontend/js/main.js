@@ -1,6 +1,6 @@
-import { fetchTileList, fetchTileData, fetchTileVersions } from './api.js?v=13';
-import { initScene, renderGraph, clearScene } from './viewer.js?v=13';
-import { initInteraction } from './interaction.js?v=13';
+import { fetchTileList, fetchTileData, fetchTileVersions } from './api.js?v=14';
+import { initScene, renderGraph, clearScene } from './viewer.js?v=14';
+import { initInteraction } from './interaction.js?v=14';
 
 async function initApp() {
     const container = document.body;

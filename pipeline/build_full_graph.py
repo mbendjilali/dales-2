@@ -8,9 +8,12 @@ from tqdm import tqdm
 from pipeline.lib.add_buildings import process_graph as process_buildings
 from pipeline.lib.add_vehicules import process_graph as process_vehicles
 from pipeline.lib.add_trees import process_graph as process_trees
+from pipeline.lib.add_conductor_instances import process_graph as process_conductor_instances
+from pipeline.lib.add_pole_instances import process_graph as process_pole_instances
 from pipeline.lib.generate_json_graph import adjust_instances
 from pipeline.lib.geom_utils import load_laz_points
 from backend.core.graph_manager import GraphManager, _groups_key
+from backend.core.graph_edges import strip_proximity_edges, rewire_graph_to_laz_instance_ids
 
 
 def build_full_graph(
@@ -62,7 +65,7 @@ def build_full_graph(
         if tid not in existing_ids:
             path = os.path.join(graph_dir, f"graph_{tid}.json")
             with open(path, "w") as f:
-                json.dump({"poles": [], "conductors": [], "edges": [], "bifurcations": [], "crosses": []}, f, indent=2)
+                json.dump({"poles": [], "conductors": [], "edges": []}, f, indent=2)
             graph_files.append(path)
             geom_path = os.path.join(geom_dir, f"geom_{tid}.json")
             os.makedirs(geom_dir, exist_ok=True)
@@ -99,15 +102,18 @@ def build_full_graph(
             process_buildings(graph_data, geom_data, pole_tol, building_group_tol, laz_data)
             process_vehicles(graph_data, geom_data, max_vehicles, vehicle_spacing, veh_group_tol, laz_data)
             process_trees(graph_data, geom_data, tree_group_tol, laz_data)
+            process_conductor_instances(graph_data, geom_data, laz_data)
+            process_pole_instances(graph_data, geom_data, laz_data)
+            rewire_graph_to_laz_instance_ids(graph_data, geom_data)
 
             gm = GraphManager(data_dir=os.path.dirname(graph_dir))
             gm.graph_data = graph_data
             gm.geom_data = geom_data
             gm.current_tile_id = tid
 
-            gm.graph_data["group_relations"] = []
+            strip_proximity_edges(gm.graph_data)
 
-            for object_type in ("buildings", "vehicles", "trees"):
+            for object_type in ("buildings", "vehicles"):
                 member_type = gm._member_type_for_object_type(object_type)
                 if not member_type:
                     continue
@@ -117,9 +123,13 @@ def build_full_graph(
                     if gid is not None and len(members) >= 2:
                         gm._recompute_relations_for_group(member_type, gid, members)
 
+            gm._recompute_all_tree_peer_relations()
+
             gm.recompute_auto_macros()
             graph_data = gm.graph_data
             geom_data = gm.geom_data
+        else:
+            rewire_graph_to_laz_instance_ids(graph_data, geom_data)
 
         save_data = {k: v for k, v in graph_data.items() if k != "macro_instances"}
         with open(graph_path, 'w') as f:

@@ -3,6 +3,7 @@ from scipy.spatial import cKDTree
 from typing import List, Dict, Any, Tuple
 
 from pipeline.lib.geom_utils import dbscan_obb, compute_marching_cubes_mesh, compute_obb
+from backend.core.graph_edges import upsert_unified_edge
 
 
 def process_graph(
@@ -13,7 +14,9 @@ def process_graph(
     laz_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
 ) -> Dict[str, int]:
     xyz, sem, ins = laz_data
-    buildings, building_points, building_ins = [], np.empty((0, 3)), np.empty((0,), dtype=int)
+    buildings = []
+    building_points = np.empty((0, 3))
+    building_ins = np.empty((0,), dtype=int)
 
     if len(xyz) > 0:
         building_mask = (sem == 12) | (sem == 13) | (sem == 14)
@@ -27,7 +30,8 @@ def process_graph(
                 unique_pairs = unique_pairs[:500]
 
             keep_sampled = np.array([(int(s), int(i)) in set(unique_pairs) for s, i in zip(sem_b, ins_b)])
-            building_points, building_ins = xyz_b[keep_sampled], ins_b[keep_sampled]
+            building_points = xyz_b[keep_sampled]
+            building_ins = ins_b[keep_sampled].astype(int)
 
             for (sem_class, ins_id) in unique_pairs:
                 pts = xyz_b[(sem_b == sem_class) & (ins_b == ins_id)]
@@ -82,21 +86,44 @@ def process_graph(
                 continue
             dist, idx = building_tree_2d.query(np.array([p_geom['X'], p_geom['Y']]))
             if dist <= pole_tol:
-                matched_ins = building_ins[idx]
-                pole_id_to_building_id[pid] = int(matched_ins)
+                pole_id_to_building_id[pid] = int(building_ins[idx])
                 fp = p_geom.get('footprint', {})
                 if fp.get('is_virtual', False) or (not fp and all(p_geom.get(k) is not None for k in ('X', 'Y', 'Z'))):
                     poles_to_delete.add(pid)
                     updated_poles += 1
 
+    edges = graph_data.setdefault("edges", [])
+    graph_data["edges"] = [
+        e
+        for e in edges
+        if not (
+            str(e.get("class", "")).lower() == "support"
+            and (
+                (
+                    str(e.get("b_type", "")).lower() == "pole"
+                    and int(e.get("b_id", -1)) in poles_to_delete
+                )
+                or (
+                    str(e.get("a_type", "")).lower() == "pole"
+                    and int(e.get("a_id", -1)) in poles_to_delete
+                )
+            )
+        )
+    ]
     for cond in graph_data.get('conductors', []):
-        cond.setdefault('support_buildings', [])
+        support_bids: List[int] = []
         for pid in cond.get('poles', []):
             if pid in pole_id_to_building_id:
                 bid = pole_id_to_building_id[pid]
-                if bid not in cond['support_buildings']:
-                    cond['support_buildings'].append(bid)
+                if bid not in support_bids:
+                    support_bids.append(bid)
         cond['poles'] = [p for p in cond.get('poles', []) if p not in poles_to_delete]
+        uid = cond.get("uid")
+        if uid is not None:
+            for bid in support_bids:
+                upsert_unified_edge(
+                    graph_data, "conductor", int(uid), "building", int(bid), "support_building"
+                )
     graph_data['poles'] = [p for p in poles if p['id'] not in poles_to_delete]
 
     return {"count": len(buildings), "supports": len(pole_id_to_building_id), "snapped": updated_poles}

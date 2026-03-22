@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { state } from './viewer.js?v=13';
+import { state } from './viewer.js?v=14';
 import { editGroup, saveTile } from './api.js';
 
 let raycaster = new THREE.Raycaster();
@@ -85,7 +85,10 @@ function buildGroupRelationsIndex(relations) {
     relations.forEach(r => {
         const mt = r.member_type;
         if (!groupRelationsIndex[mt]) return;
-        const gid = String(r.group_id);
+        let gid = String(r.group_id);
+        if (mt === 'tree' && r.peer_type) {
+            gid = '0';
+        }
         const bucket = groupRelationsIndex[mt].byGroup;
         let arr = bucket.get(gid);
         if (!arr) {
@@ -211,7 +214,8 @@ function buildInstanceColorsFromData(data, randomize = false) {
         const map = instanceColors.conductor;
         data.conductors.forEach(c => {
             if (c && c.id != null) {
-                map.set(c.id, pick(c.id));
+                const colorKey = c.id != null ? `inst:${c.id}` : 'conductor';
+                map.set(c.id, pick(colorKey));
             }
         });
     }
@@ -265,28 +269,59 @@ function buildMacroColorsFromMacros(macros, randomize = false) {
     });
 }
 
+function _groupIdForClusterObject(groupsKey, objectId) {
+    const groups = currentData && currentData[groupsKey];
+    if (!Array.isArray(groups)) return null;
+    const oid = Number(objectId);
+    for (const g of groups) {
+        const mem = g.members || [];
+        if (mem.some(m => Number(m) === oid)) return g.id;
+    }
+    return null;
+}
+
 function getMacroColor(typeKey, id, fallback) {
-    if (!currentData || !macroMembershipIndex) return fallback;
+    if (!currentData) return fallback;
     // Map internal color type keys to macro member_type
     const memberTypeByKey = {
         conductor: 'conductor',
         pole: 'pole',
         building: 'building',
         vehicle: 'vehicle',
+        tree: 'tree',
     };
     const memberType = memberTypeByKey[typeKey];
     if (!memberType) return fallback;
-    const typeMap = macroMembershipIndex[memberType];
-    if (!typeMap) return fallback;
-    const list = typeMap.get(String(id));
-    if (!list || !list.length) return fallback;
-    // Use the first macro for color assignment
-    const macro = list[0];
-    if (!macroColors.size) {
-        buildMacroColorsFromMacros(currentData.macro_instances || []);
+
+    if (macroMembershipIndex) {
+        const typeMap = macroMembershipIndex[memberType];
+        if (typeMap) {
+            const list = typeMap.get(String(id));
+            if (list && list.length) {
+                const macro = list[0];
+                if (!macroColors.size) {
+                    buildMacroColorsFromMacros(currentData.macro_instances || []);
+                }
+                const val = macroColors.get(macro.id);
+                if (typeof val === 'number') return val;
+            }
+        }
     }
-    const val = macroColors.get(macro.id);
-    return (typeof val === 'number') ? val : fallback;
+
+    // Building / vehicle / tree clusters: color by macro tab group_id (no electrical macro)
+    const clusterKey = {
+        building: 'buildingGroups',
+        vehicle: 'vehicleGroups',
+        tree: 'treeGroups',
+    }[typeKey];
+    if (clusterKey) {
+        const gid = _groupIdForClusterObject(clusterKey, id);
+        if (gid != null && gid !== undefined) {
+            return colorFromIdStable(`cluster:${typeKey}:${gid}`);
+        }
+    }
+
+    return fallback;
 }
 
 // Global helper: find all macro instances related to a selection
@@ -768,7 +803,6 @@ function rebuildTreeMeshes(selectedTreeIdsSet, groupedTreeIdsSet) {
     const selectedMesh = makeTreeMesh(selectedTrees, COLOR_SELECTED);
     const groupMesh = makeTreeMesh(groupedTrees, COLOR_EXTENSION);
 
-    // Keep a reference for compatibility (used in a few places)
     state.meshes.treeMesh = baseMesh || selectedMesh || groupMesh || null;
 }
 
@@ -1340,12 +1374,13 @@ function updateHighlights() {
         const id = String(active.id);
         const data = currentData;
 
-        const extGroup = data.extensionGroups
-            ? data.extensionGroups.find(g => g && g.includes(id))
-            : null;
-        const extIds = (extGroup && extGroup.length) ? extGroup : [id];
-        const bifurcationIds = (data.bifurcations && data.bifurcations[id]) ? data.bifurcations[id] : [];
-        const crossIds = (data.crosses && data.crosses[id]) ? data.crosses[id] : [];
+        const extIds = (data.conductorExtensions && data.conductorExtensions[id])
+            ? data.conductorExtensions[id].map(String)
+            : [];
+        const bifurcationIds = ((data.bifurcations && data.bifurcations[id]) ? data.bifurcations[id] : [])
+            .filter(b => String(b) !== id);
+        const crossIds = ((data.crosses && data.crosses[id]) ? data.crosses[id] : [])
+            .filter(x => String(x) !== id);
         const supportPoleIds = (data.supportPoles && data.supportPoles[id]) ? data.supportPoles[id] : [];
         const supportBuildingIds = (data.supportBuildings && data.supportBuildings[id]) ? data.supportBuildings[id] : [];
 
@@ -1473,8 +1508,8 @@ function updateInfoPanel(selection) {
         const t = sel.type;
         const id = sel.id;
         if (t === 'macro') {
-            // Macro itself
-            const m = relatedMacros[0] || macros.find(mm => mm.id === id && mm.type === sel.macroType);
+            const macrosArr = Array.isArray(data.macro_instances) ? data.macro_instances : [];
+            const m = relatedMacros[0] || macrosArr.find(mm => mm.id === id && mm.type === sel.macroType);
             const cls = m ? macroClassLabel(m) : sel.macroType || 'Macro';
             return `${cls} ${id}`;
         }
@@ -1484,7 +1519,8 @@ function updateInfoPanel(selection) {
             const obj = arr.find(o => String(o.id) === String(id));
             return obj ? obj.sem_class : null;
         })());
-        return `${pretty} ${id}`;
+        const idDisp = t === 'conductor' ? conductorDisplayLabel(id) : id;
+        return `${pretty} ${idDisp}`;
     })();
 
     let html = `<b>${baseLabel}</b><br>`;
@@ -1492,37 +1528,41 @@ function updateInfoPanel(selection) {
     // Macro lines: {macro class} {macro instance id}
     relatedMacros.forEach(m => {
         const clsLabel = macroClassLabel(m);
-        html += `<span class="macro-class-editable" data-macro-id="${m.id}" data-macro-type="${m.type}">${clsLabel}</span> ${m.id}<br>`;
+        html += `${clsLabel} ${m.id}<br>`;
     });
 
-    // Relation lines per type (existing, non-typed relations)
+    // Conductor graph relations (same arrow style as typed cluster relations below)
     if (sel && sel.type === 'conductor') {
         const id = String(sel.id);
-        const extGroup = data.extensionGroups
-            ? data.extensionGroups.find(g => g && g.includes(id)) || [id]
-            : [id];
-        const bifList = data.bifurcations && data.bifurcations[id] ? data.bifurcations[id] : [];
-        const crossList = data.crosses && data.crosses[id] ? data.crosses[id] : [];
-        const supPoles = data.supportPoles && data.supportPoles[id] ? data.supportPoles[id] : [];
-        const supBuilds = data.supportBuildings && data.supportBuildings[id] ? data.supportBuildings[id] : [];
-        const supGrounds = data.supportGrounds && data.supportGrounds[id] ? data.supportGrounds[id] : [];
-        const grouped = extGroup && extGroup.length ? extGroup : [id];
+        const extList = (data.conductorExtensions && data.conductorExtensions[id]) ? data.conductorExtensions[id] : [];
+        const bifList = ((data.bifurcations && data.bifurcations[id]) ? data.bifurcations[id] : [])
+            .filter(u => String(u) !== id);
+        const crossList = ((data.crosses && data.crosses[id]) ? data.crosses[id] : [])
+            .filter(u => String(u) !== id);
+        const parts = [];
+        if (extList.length) {
+            parts.push(`Extensions → ${extList.map(conductorDisplayLabel).join(', ')}`);
+        }
+        if (bifList.length) {
+            parts.push(`Bifurcations → ${bifList.map(conductorDisplayLabel).join(', ')}`);
+        }
+        if (crossList.length) {
+            parts.push(`Crosses → ${crossList.map(conductorDisplayLabel).join(', ')}`);
+        }
+        if (parts.length) html += parts.join('<br>') + '<br>';
+    }
 
-        html += (
-            (grouped.length ? `Extensions ${grouped.join(', ')}\n` : '') +
-            (bifList.length ? `Bifurcations ${bifList.join(', ')}\n` : '\n') +
-            (crossList.length ? `Crosses ${crossList.join(', ')}\n` : '\n') +
-            (supPoles.length ? `Support Poles ${supPoles.join(', ')}\n` : '\n') +
-            (supBuilds.length ? `Support Buildings ${supBuilds.join(', ')}\n` : '\n') +
-            (supGrounds.length ? `Support Ground ${supGrounds.join(', ')}\n` : '\n'));
-    } else if (sel && sel.type === 'pole') {
+    if (sel && sel.type === 'pole') {
         const conductors = (data.poleToConductors && data.poleToConductors[sel.id]) || [];
-        html += (conductors.length ? `Supported conductors ${conductors.join(', ')}\n` : '\n');
+        html += (conductors.length
+            ? `Supported conductors ${conductors.map(conductorDisplayLabel).join(', ')}\n`
+            : '\n');
     } else if (sel && sel.type === 'building') {
         const supportConductors =
             (data.buildingToSupportConductors && data.buildingToSupportConductors[sel.id]) || [];
-        html +=
-            (supportConductors.length ? `Supported conductors ${supportConductors.join(', ')}\n` : '\n');
+        html += supportConductors.length
+            ? `Supported conductors ${supportConductors.map(conductorDisplayLabel).join(', ')}\n`
+            : '\n';
     }
     // Typed intra-group relations for single selection (buildings/vehicles/trees)
     const relDetail = buildRelationSummaryForSingle(sel);
@@ -1531,18 +1571,6 @@ function updateInfoPanel(selection) {
     }
 
     el.innerHTML = html;
-
-    // Make macro class elements clickable to edit macro class
-    const macroSpans = el.querySelectorAll('.macro-class-editable');
-    macroSpans.forEach(span => {
-        span.addEventListener('click', () => {
-            const macroId = parseInt(span.getAttribute('data-macro-id'), 10);
-            const macroType = span.getAttribute('data-macro-type');
-            if (!Number.isNaN(macroId) && macroType) {
-                cycleMacroClass(macroId, macroType);
-            }
-        });
-    });
 }
 
 function buildRelationSummaryForSelection() {
@@ -1601,50 +1629,122 @@ function buildRelationSummaryForSelection() {
     return lines.length ? lines.join('<br>') : '';
 }
 
+/** Resolve conductor row by scene id (string LAZ instance id). */
+function conductorRowBySceneId(data, idOrKey) {
+    const conds = data && data.conductors;
+    if (!Array.isArray(conds)) return null;
+    const s = String(idOrKey);
+    return conds.find(c => String(c.id) === s) || null;
+}
+
+/** User-visible conductor label from graph relation id (numeric instance id). */
+function conductorDisplayLabelFromData(data, idOrKey) {
+    const row = conductorRowBySceneId(data, idOrKey);
+    if (!row) return idOrKey != null ? String(idOrKey) : '';
+    return String(row.id);
+}
+
+function conductorDisplayLabel(idOrKey) {
+    return conductorDisplayLabelFromData(currentData, idOrKey);
+}
+
+function formatPeerRelationLabel(peerType, peerId) {
+    const pt = (peerType || '').toLowerCase();
+    const id = Number(peerId);
+    const data = currentData || {};
+    if (pt === 'building') {
+        return `Building ${id}`;
+    }
+    if (pt === 'vehicle') {
+        return `Vehicle ${id}`;
+    }
+    if (pt === 'pole') {
+        return `Pole ${id}`;
+    }
+    if (pt === 'conductor') {
+        return `Conductor ${conductorDisplayLabel(peerId)}`;
+    }
+    return `${peerType} ${id}`;
+}
+
+/** Typed label for same-class objects (building, vehicle, tree) in intra-group relations. */
+function formatSameClassObjectLabel(objType, id) {
+    const n = Number(id);
+    if (objType === 'building') return `Building ${n}`;
+    if (objType === 'vehicle') return `Vehicle ${n}`;
+    if (objType === 'tree') return `Tree ${n}`;
+    return String(id);
+}
+
 function buildRelationSummaryForSingle(selection) {
     if (!selection) return '';
-    const type = selection.type;
+    const rels = currentData.groupRelations || [];
+
+    const mergedByClass = { adjacent: new Set(), near: new Set() };
+
+    if (selection.type === 'tree') {
+        const sid = String(selection.id);
+        rels.forEach(r => {
+            if (!r.peer_type || String(r.a_id) !== sid) return;
+            const cls = (r.class || 'group').toLowerCase();
+            if (!RELATION_PRIORITY.includes(cls)) return;
+            mergedByClass[cls].add(formatPeerRelationLabel(r.peer_type, r.b_id));
+        });
+    } else {
+        const pt = { building: 'building', vehicle: 'vehicle', pole: 'pole', conductor: 'conductor' }[selection.type];
+        if (pt) {
+            const pid = Number(selection.id);
+            rels.forEach(r => {
+                if (r.peer_type !== pt || Number(r.b_id) !== pid) return;
+                const cls = (r.class || 'group').toLowerCase();
+                if (!RELATION_PRIORITY.includes(cls)) return;
+                mergedByClass[cls].add(`Tree ${r.a_id}`);
+            });
+        }
+    }
+
     const memberTypeBySelection = {
         building: 'building',
         vehicle: 'vehicle',
         tree: 'tree',
     };
+    const type = selection.type;
     const memberType = memberTypeBySelection[type];
-    if (!memberType || !groupRelationsIndex[memberType]) return '';
-
-    const collNameByType = {
-        building: 'buildings',
-        vehicle: 'vehicles',
-        tree: 'trees',
-    };
-    const collName = collNameByType[type];
-    const coll = currentData[collName] || [];
-    const idToObj = new Map(coll.map(o => [o.id, o]));
-    const obj = idToObj.get(selection.id);
-    if (!obj || obj.group_id == null) return '';
-
-    const gid = String(obj.group_id);
-    const bucket = groupRelationsIndex[memberType].byGroup.get(gid);
-    if (!bucket || !bucket.length) return '';
-
-    const selfIdStr = String(selection.id);
-    const byClass = {};
-    bucket.forEach(r => {
-        const a = String(r.a_id);
-        const b = String(r.b_id);
-        if (a !== selfIdStr && b !== selfIdStr) return;
-        const other = (a === selfIdStr) ? b : a;
-        const cls = r.class || 'group';
-        if (!byClass[cls]) byClass[cls] = new Set();
-        byClass[cls].add(other);
-    });
+    if (memberType && groupRelationsIndex[memberType]) {
+        const collNameByType = {
+            building: 'buildings',
+            vehicle: 'vehicles',
+            tree: 'trees',
+        };
+        const collName = collNameByType[type];
+        const coll = currentData[collName] || [];
+        const idToObj = new Map(coll.map(o => [o.id, o]));
+        const obj = idToObj.get(selection.id);
+        if (obj && obj.group_id != null) {
+            const gid = String(obj.group_id);
+            const bucket = groupRelationsIndex[memberType].byGroup.get(gid);
+            const selfIdStr = String(selection.id);
+            if (bucket && bucket.length) {
+                bucket.forEach(r => {
+                    if (r.peer_type) return;
+                    const cls = (r.class || 'group').toLowerCase();
+                    if (!RELATION_PRIORITY.includes(cls)) return;
+                    const a = String(r.a_id);
+                    const b = String(r.b_id);
+                    if (a !== selfIdStr && b !== selfIdStr) return;
+                    const other = (a === selfIdStr) ? b : a;
+                    mergedByClass[cls].add(formatSameClassObjectLabel(type, other));
+                });
+            }
+        }
+    }
 
     const lines = [];
     RELATION_PRIORITY.forEach(cls => {
-        const set = byClass[cls];
+        const set = mergedByClass[cls];
         if (set && set.size) {
-            const ids = Array.from(set).join(', ');
-            lines.push(`${cls.charAt(0).toUpperCase() + cls.slice(1)} → ${ids}`);
+            const parts = Array.from(set).sort();
+            lines.push(`${cls.charAt(0).toUpperCase() + cls.slice(1)} — ${parts.join(', ')}`);
         }
     });
     return lines.length ? lines.join('<br>') : '';
@@ -1663,6 +1763,7 @@ async function handleGroupRelationCycleShortcut() {
     };
     const memberType = memberTypeBySelection[first.type];
     if (!memberType || !groupRelationsIndex[memberType]) return;
+    if (memberType === 'tree') return;
 
     const collNameByType = {
         building: 'buildings',
@@ -1754,6 +1855,10 @@ async function handleGroupRelationCycleShortcut() {
                 ? currentData.groupRelations
                 : [];
             const makeKey = r => {
+                const pt = r.peer_type ? String(r.peer_type) : '';
+                if (pt) {
+                    return `${r.member_type}|${r.group_id}|${pt}|${r.a_id}-${r.b_id}`;
+                }
                 const [a, b] = [String(r.a_id), String(r.b_id)].sort();
                 return `${r.member_type}|${r.group_id}|${a}-${b}`;
             };
@@ -1893,7 +1998,9 @@ function populateLists(data) {
         sortedGroups.forEach(item => {
             const li = document.createElement('li');
             li.id = 'comp-li-' + item.originalIndex;
-            li.textContent = `Extension ${item.originalIndex}`;
+            const labels = (item.group || []).map(cid => conductorDisplayLabelFromData(data, cid));
+            const joined = labels.join(', ');
+            li.textContent = joined.length > 96 ? `${joined.slice(0, 93)}… (${item.length})` : joined;
             li.onclick = () => {
                 if (item.group && item.group.length > 0) {
                     const firstId = item.group[0];

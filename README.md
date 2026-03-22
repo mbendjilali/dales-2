@@ -18,6 +18,7 @@ pipeline/                 Batch processing pipeline
     add_buildings.py        Building extraction and OBB-based clustering
     add_vehicules.py        Vehicle extraction and OBB-based clustering
     add_trees.py            Tree extraction and OBB-based clustering
+    add_conductor_instances.py  LAZ instance id on conductors (powerline match)
     find_extensions.py      Conductor extension detection
     find_supports.py        Pole–building support detection
     geom_utils.py           LAZ loading, DBSCAN-OBB, geometry helpers
@@ -34,7 +35,9 @@ frontend/                 Three.js web viewer
 scripts/                  Standalone utilities
   count_edges.py          CSV report of edge types across all graph files
   visualize_network.py    Matplotlib-based network visualization
-  migrate_geom.py         Legacy geometry format migration
+  dev/                    Development checks (not part of the release pipeline)
+    check_laz_instance_uniqueness.py  Verify instance id ↔ one semantic class per LAZ
+    remap_laz_instance_ids.py         Remap: stuff classes → instance 0; others → 1..N
 
 data/                     Runtime data (not tracked in git)
   network/                Raw network JSON files (poles, conductors)
@@ -81,7 +84,9 @@ Dependencies: `fastapi`, `uvicorn`, `numpy`, `scipy`, `laspy`, `scikit-image`, `
 Each tile is a LAZ (or LAS) file with per-point fields:
 
 - **classification** — semantic class ID (see taxonomy above)
-- **instance** (or equivalent) — per-object instance ID within each class
+- **instance** (or equivalent) — per-object instance ID, **unique across all semantic classes** in the tile (dataset convention)
+
+Dev helpers: `scripts/dev/check_laz_instance_uniqueness.py` (see project tree). To normalize instance ids, `scripts/dev/remap_laz_instance_ids.py` sets instance **0** for comma-separated **stuff** semantic classes (`--stuff-classes`, default `0,1,4`) and assigns contiguous **1…N** for all other classes.
 
 ### Input: Network JSON (Optional)
 
@@ -123,35 +128,34 @@ Each `graph_<tile_id>.json` contains only topological and semantic data:
 ```json
 {
   "poles": [
-    { "id": 0, "sem_class": 9, "is_ground": false, "is_building_support": false }
+    { "id": 501, "instance_id": 501, "sem_class": 9, "is_ground": false, "is_building_support": false }
   ],
   "conductors": [
-    { "link_idx": 0, "conductor_id": 0, "poles": [0, 1], "component": 0, "sem_class": 3 }
+    { "link_idx": 0, "conductor_id": 0, "poles": [501, 502], "component": 0, "sem_class": 3, "instance_id": 9001 }
   ],
-  "edges": [ [0, 1] ],
-  "bifurcations": [ [2, 3] ],
-  "crosses": [ [4, 5] ],
+  "edges": [
+    { "id": 0, "a_type": "conductor", "a_id": 9001, "b_type": "conductor", "b_id": 9002, "class": "extension" },
+    { "id": 1, "a_type": "conductor", "a_id": 9001, "b_type": "pole", "b_id": 501, "class": "support" },
+    { "id": 2, "a_type": "building", "a_id": 40, "b_type": "building", "b_id": 42, "class": "adjacent" },
+    { "id": 3, "a_type": "building", "a_id": 42, "b_type": "tree", "b_id": 3, "class": "near" }
+  ],
 
   "buildings": [
-    { "id": 0, "sem_class": 12, "group_id": 0 }
+    { "id": 42, "sem_class": 12, "group_id": 0 }
   ],
   "vehicles": [
-    { "id": 0, "sem_class": 2, "group_id": 0 }
+    { "id": 7, "sem_class": 2, "group_id": 0 }
   ],
   "trees": [
-    { "id": 0, "sem_class": 5, "group_id": 0 }
+    { "id": 3 }
   ],
 
   "building_groups": [ { "id": 0, "members": [0, 1, 2] } ],
   "vehicle_groups":  [ { "id": 0, "members": [0, 1] } ],
-  "tree_groups":     [ { "id": 0, "members": [0, 1, 2, 3] } ],
-
-  "group_relations": [
-    { "id": 0, "member_type": "building", "group_id": 0, "a_id": 0, "b_id": 1, "class": "adjacent" }
-  ],
+  "tree_groups": [],
 
   "connector_spans": [
-    { "id": 0, "poles": [0, 1], "conductor_ids": ["0_0", "0_1"], "label": "Span 0-1" }
+    { "id": 0, "poles": [501, 502], "conductor_ids": ["9001", "9002"], "label": "Span 501-502" }
   ],
   "electrical_grids": [
     { "id": 0, "span_ids": [0, 1, 2], "label": "Grid (3 spans)" }
@@ -159,14 +163,34 @@ Each `graph_<tile_id>.json` contains only topological and semantic data:
 }
 ```
 
+### `edges` (single relation list)
+
+Every link uses **`{ "id", "a_type", "b_type", "a_id", "b_id", "class" }`**. Types include `building`, `conductor`, `pole`, `tree`, `vehicle`. Classes include **`extension`**, **`bifurcation`**, **`cross`**, **`support`** (conductor–pole), **`support_building`** (conductor–building), **`adjacent`**, **`near`**. Endpoints are stored in **canonical order** (type order then id). After `rewire_graph_to_laz_instance_ids`, **`a_id` / `b_id` for `conductor`** are **`instance_id`** values (LAZ when matched, else a synthetic id). **`pole`** endpoints use LAZ instance ids when matched.
+
+The HTTP API and viewer receive a derived **`group_relations`** array (member_type, group_id, optional peer_type) built from proximity edges for the UI.
+
 ### Relation Types
 
-- **`adjacent`** — OBB gap ≤ class-specific threshold (building: 1.0 m, vehicle: 0.25 m, tree: 0.25 m)
-- **`near`** — Connected by a Delaunay triangulation edge with OBB gap ≤ class-specific threshold (building: 15.0 m, vehicle: 8.0 m, tree: 20.0 m). `adjacent` takes priority over `near`.
+**Building / vehicle clusters (same-type pairs)** — `a_type` and `b_type` match; `a_id` / `b_id` sorted.
+
+- **`adjacent`** — OBB gap ≤ class-specific threshold (building: 1.0 m, vehicle: 0.25 m).
+- **`near`** — Delaunay edge on cluster centroids with OBB gap ≤ threshold (building: 20.0 m, vehicle: 5.0 m). `adjacent` takes priority over `near`.
+
+**Tree ↔ other objects** — stored as edges with types `tree` and peer type (`building`, `vehicle`, `pole`, `conductor`). No tree–tree relations; **`tree_groups` is always empty** and trees have **no** `group_id`. Classification is **gap-only** between tree footprint and peer geometry: `adjacent` if gap ≤ 0.1 m, else `near` if gap ≤ 5.0 m (`ADJACENT_DIST_MAX` / `NEAR_DIST_MAX` for `tree` in `graph_manager.py`).
+
+### Object IDs and LAZ traceability
+
+For `buildings`, `vehicles`, and `trees`, the graph object **`id`** is the LAZ **`instance`** value from the point cloud (via `pipeline.lib.geom_utils.load_laz_points`). The dataset guarantees **global uniqueness** of instance IDs across semantic classes within a tile, so no extra encoding is applied. **`sem_class`** is stored on **buildings** and **vehicles**; **trees** in the graph are only `{ "id" }` (semantic class for trees is fixed in the LAZ pipeline).
+
+For **`conductors`**, **`link_idx`** and **`conductor_id`** stay as in the network; geometry keys remain **`"{link_idx}_{conductor_id}"`**. During graph generation a temporary numeric **`uid`** links edges until **`rewire_graph_to_laz_instance_ids`**: it assigns **`instance_id`** from **powerline** points when possible (`pipeline.lib.add_conductor_instances`), otherwise a **synthetic** id (`SYNTHETIC_CONDUCTOR_INSTANCE_ID_BASE + uid` in `backend.core.graph_edges`), rewrites **`edges`**, then **removes `uid`** from saved graphs. **`poles`** get **`instance_id`** from pole-class points (classes 9–11, `pipeline.lib.add_pole_instances`); **`poles[].id`** and **`geom_*.json` pole keys** follow LAZ instances when uniquely mappable.
+
+The viewer scene conductor object uses only **`id`** (string form of **`instance_id`**).
+
+Geometry dictionaries (`geom_*.json`) use `str(id)` as keys for buildings, vehicles, trees, and **poles** (LAZ instance id after rewire). **Conductors** stay keyed by **`link_idx_conductor_id`**.
 
 ### Clustering
 
-Objects are clustered per-class using DBSCAN on OBB (Oriented Bounding Box) shortest distances. Each cluster becomes a group (`*_groups`). Relations are computed within each group using Delaunay triangulation on 2D centroids.
+**Buildings** and **vehicles** are clustered per-class using DBSCAN on OBB shortest distances; each cluster gets same-type `adjacent` / `near` relations via Delaunay on 2D centroids. **Trees are not clustered** (`tree_groups` is always `[]`). **Trees** get **undirected** `adjacent` / `near` relations to every building, vehicle, pole, and conductor in the tile (gap-based), not to other trees.
 
 ## Geometry JSON Schema
 
@@ -176,7 +200,7 @@ Each `geom_<tile_id>.json` contains visualization data only:
 {
   "scale": 1.0,
   "poles": { "<id>": { "X": 0.0, "Y": 0.0, "Z": 0.0, "footprint": { "min": [], "max": [], "rotation": [] } } },
-  "conductors": { "<uid>": { "model": {}, "startpoint": [], "endpoint": [] } },
+  "conductors": { "<link_idx>_<conductor_id>": { "model": {}, "startpoint": [], "endpoint": [] } },
   "buildings": { "<id>": { "min": [], "max": [], "obb": { "center": [], "extents": [], "axes": [], "footprint": [] } } },
   "buildingHulls": { "<id>": { "vertices": [], "faces": [] } },
   "vehicles": { "<id>": { "min": [], "max": [], "obb": { "center": [], "extents": [], "axes": [], "footprint": [] } } },

@@ -207,7 +207,9 @@ def load_laz_points(laz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     Returns:
         points: (N, 3) float array of XYZ coordinates
         sem_classes: (N,) int array of semantic classes
-        ins_classes: (N,) int array of instance classes
+        ins_classes: (N,) int array of instance IDs (dataset convention: unique across all classes in the tile)
+
+    Pipeline code uses ins_classes directly as graph object ids for buildings/vehicles/trees.
     """
     las = laspy.read(laz_path)
     if 'classification' not in las.point_format.dimension_names:

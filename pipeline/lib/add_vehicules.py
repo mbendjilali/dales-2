@@ -31,9 +31,8 @@ def process_graph(
                 pts = xyz_v[mask]
                 if len(pts) == 0:
                     continue
-                vid = len(vehicles)
                 vehicles.append({
-                    "id": vid, "sem_class": int(sem_class), "ins_id": int(ins_id),
+                    "id": int(ins_id), "sem_class": int(sem_class),
                     "min": [float(x) for x in np.min(pts, axis=0)],
                     "max": [float(x) for x in np.max(pts, axis=0)],
                     "hull": compute_marching_cubes_mesh(pts, spacing=spacing),
