@@ -18,6 +18,7 @@ from backend.core.graph_edges import (
     conductor_pole_ids_from_edges,
     conductor_support_building_ids_from_edges,
 )
+from backend.core.graph_io import load_merged_graph, save_split_graph
 from pipeline.lib.generate_json_graph import build_instance_graph
 from pipeline.lib.find_supports import get_node_attachments, reconstruct_footprints
 
@@ -113,8 +114,16 @@ def visualize_network_web(
         output_file = f"web_{base}.html"
     
     print(f"Loading {json_file}...")
-    with open(json_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    _bn = os.path.basename(json_file)
+    if (
+        _bn.startswith("graph_")
+        and _bn.endswith(".json")
+        and not _bn.endswith("_edges.json")
+    ):
+        data = load_merged_graph(json_file)
+    else:
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
     # Check if input is already a graph (has poles/conductors) or raw network (nodes/links)
     if 'poles' in data and 'conductors' in data:
@@ -206,9 +215,8 @@ def visualize_network_web(
         if base.lower().endswith(".json"):
             base = base[:-5]
         graph_output_file = f"graph_{base}.json"
-        with open(graph_output_file, 'w', encoding='utf-8') as f:
-            json.dump(graph_data, f, indent=2)
-        print(f"Graph byproduct saved to {graph_output_file}")
+        save_split_graph(graph_output_file, graph_data)
+        print(f"Graph byproduct saved to {graph_output_file} (+ _edges.json)")
 
     # Prepare Data for JSON Injection
     # Poles from graph_data already have cleaned fields

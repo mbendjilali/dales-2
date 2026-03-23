@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Tuple, Optional
 
 from pipeline.lib.find_extensions import get_all_conductors, find_extensions
 from backend.core.graph_edges import upsert_unified_edge
+from backend.core.graph_io import save_split_graph
 
 
 def build_instance_graph(
@@ -145,8 +146,8 @@ def build_instance_graph(
 def adjust_instances(input_path: str, tolerance: float = float("inf"), output_path: Optional[str] = None) -> str:
     """
     Load a network JSON, compute its extension graph, and dump a companion
-    JSON named 'graph_{filename}.json' (by default).
-    Also writes the separated geometry data to a 'geom_{filename}.json' file.
+    JSON pair 'graph_{filename}.json' (nodes/groups) and 'graph_{filename}_edges.json' (edges only).
+    Also writes geometry to 'geom_{filename}.json'.
     
     Returns the path to the written graph JSON.
     """
@@ -161,8 +162,7 @@ def adjust_instances(input_path: str, tolerance: float = float("inf"), output_pa
             base = base[:-5]
         output_path = f"graph_{base}.json"
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(graph_data, f, indent=2)
+    save_split_graph(output_path, graph_data)
 
     # Automatically derive geom path from graph path
     geom_path = output_path.replace("graph_", "geom_").replace("graph", "geometry")
@@ -177,7 +177,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Compute the extension graph for a network JSON or directory "
-            "and dump to 'graph_{filename}.json'."
+            "and dump to 'graph_{filename}.json' + 'graph_{filename}_edges.json'."
         )
     )
     parser.add_argument("--json", required=True, help="Path to the input network JSON file or directory.")

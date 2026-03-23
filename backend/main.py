@@ -12,6 +12,7 @@ from typing import List, Optional, Any, Dict
 from backend.core.graph_manager import GraphManager, _groups_key
 from backend.core.scene_builder import build_scene_data
 from backend.core.graph_edges import to_frontend_group_relations
+from backend.core.graph_io import is_graph_edges_file, load_merged_graph, save_split_graph
 
 app = FastAPI()
 
@@ -61,6 +62,8 @@ async def get_tiles() -> List[str]:
     base_ids = set()
     for f in files:
         basename = os.path.basename(f)
+        if is_graph_edges_file(f):
+            continue
         if not (basename.startswith("graph_") and basename.endswith(".json")):
             continue
         tile_id = basename[6:-5]
@@ -83,6 +86,8 @@ async def get_tile_versions(base_id: str):
     versions = []
     for f in sorted(files):
         basename = os.path.basename(f)
+        if is_graph_edges_file(f):
+            continue
         if not (basename.startswith("graph_") and basename.endswith(".json")):
             continue
         tile_id = basename[6:-5]
@@ -213,8 +218,7 @@ async def load_laz(
                 net_path = tmp_net.name
             out_path = os.path.join(graph_dir, f"graph_{tile_id}.json")
             adjust_instances(net_path, output_path=out_path)
-            with open(out_path, "r") as f:
-                graph_data = json.load(f)
+            graph_data = load_merged_graph(out_path)
             geom_path_out = os.path.join(geom_dir, f"geom_{tile_id}.json")
             if os.path.exists(geom_path_out):
                 with open(geom_path_out, "r") as f:
@@ -253,9 +257,7 @@ async def load_laz(
         gm.recompute_auto_macros()
 
         graph_path = os.path.join(graph_dir, f"graph_{tile_id}.json")
-        save_data = {k: v for k, v in gm.graph_data.items() if k != "macro_instances"}
-        with open(graph_path, "w") as f:
-            json.dump(save_data, f, indent=2, allow_nan=False)
+        save_split_graph(graph_path, gm.graph_data)
         geom_path = os.path.join(geom_dir, f"geom_{tile_id}.json")
         with open(geom_path, "w") as f:
             json.dump(gm.geom_data, f, indent=2, allow_nan=False)

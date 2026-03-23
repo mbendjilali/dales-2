@@ -1,19 +1,24 @@
 import os
-import json
 import glob
 import csv
+import sys
 from collections import defaultdict
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from backend.core.graph_io import filter_graph_node_paths, load_merged_graph
 
 
 def count_edges():
-    graph_files = glob.glob("data/graph/graph_*.json")
+    graph_files = filter_graph_node_paths(glob.glob("data/graph/graph_*.json"))
 
     results = []
     all_rel_classes = set()
 
     for gf in sorted(graph_files):
-        with open(gf, "r") as f:
-            data = json.load(f)
+        data = load_merged_graph(gf)
 
         edges = data.get("edges") or []
 

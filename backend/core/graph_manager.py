@@ -13,6 +13,7 @@ from backend.core.graph_edges import (
     PROXIMITY_EDGE_CLASSES,
     conductor_pole_ids_from_edges,
 )
+from backend.core.graph_io import load_merged_graph, save_split_graph, is_graph_edges_file
 
 GROUP_TYPES = ("trees", "buildings", "vehicles", "poles", "conductors")
 
@@ -59,6 +60,10 @@ class GraphManager:
         self.current_tile_id = tile_id
 
         graph_path = self._get_graph_path(tile_id)
+        if is_graph_edges_file(graph_path):
+            raise FileNotFoundError(
+                "Use the node graph path graph_{tile}.json, not *_edges.json"
+            )
         # Geometry is shared between original and edited versions:
         # try geom_{tile_id}.json first, then fall back to the base id (before any _edit_ suffix).
         geom_path = self._get_geom_path(tile_id)
@@ -71,8 +76,7 @@ class GraphManager:
         if not os.path.exists(graph_path):
             raise FileNotFoundError(f"Graph file not found: {graph_path}")
 
-        with open(graph_path, "r") as f:
-            self.graph_data = json.load(f)
+        self.graph_data = load_merged_graph(graph_path)
 
         self._normalize_trees_not_clustered()
 
@@ -93,10 +97,10 @@ class GraphManager:
 
     def save_tile(self, tile_id: str) -> str:
         """
-        Save the current in-memory graph to a new edited file.
+        Save the current in-memory graph to a new edited file pair.
 
-        Original graph_{tile_id}.json is left untouched.
-        New files are named: graph_{tile_id}_edit_{count}.json.
+        Original graph_{tile_id}.json (+ _edges) is left untouched.
+        New files: graph_{tile_id}_edit_{count}.json and graph_{tile_id}_edit_{count}_edges.json.
         """
         if self.current_tile_id != tile_id:
             raise ValueError(
@@ -109,16 +113,16 @@ class GraphManager:
 
         prefix = f"{name}_edit_"
         pattern = os.path.join(base_dir, f"{prefix}*.json")
-        existing = glob.glob(pattern)
+        existing = [
+            p for p in glob.glob(pattern) if not is_graph_edges_file(p)
+        ]
         next_index = len(existing) + 1
 
         new_name = f"{prefix}{next_index}{ext}"
         new_path = os.path.join(base_dir, new_name)
 
         os.makedirs(base_dir, exist_ok=True)
-        save_data = {k: v for k, v in self.graph_data.items() if k != "macro_instances"}
-        with open(new_path, "w") as f:
-            json.dump(save_data, f, indent=2)
+        save_split_graph(new_path, self.graph_data)
 
         return new_path
 

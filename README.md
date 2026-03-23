@@ -123,7 +123,16 @@ Open `http://localhost:8000`, click **Upload**, select a LAZ/LAS file (and optio
 
 ## Graph JSON Schema
 
-Each `graph_<tile_id>.json` contains only topological and semantic data:
+Graphs are stored as **two files per tile** (and the same pattern for edits: `graph_<tile>_edit_<n>_edges.json`):
+
+| File | Contents |
+|------|-----------|
+| `graph_<tile_id>.json` | Nodes (`poles`, `conductors`, `buildings`, `vehicles`, `trees`), **`building_groups`**, **`vehicle_groups`**, **`tree_groups`**, **`connector_spans`**, **`electrical_grids`**, etc. **No** top-level **`edges`** key. |
+| `graph_<tile_id>_edges.json` | **Only** `{ "edges": [ ... ] }` — all relations (extension, support, adjacent, …). |
+
+`backend.core.graph_io.load_merged_graph` / `save_split_graph` merge and split for tools. Legacy single-file graphs with an **`edges`** key inside the node file are still read correctly if the `*_edges.json` file is missing.
+
+**`graph_<tile_id>.json`** (nodes / groups — example):
 
 ```json
 {
@@ -132,12 +141,6 @@ Each `graph_<tile_id>.json` contains only topological and semantic data:
   ],
   "conductors": [
     { "link_idx": 0, "conductor_id": 0, "poles": [501, 502], "component": 0, "sem_class": 3, "instance_id": 9001 }
-  ],
-  "edges": [
-    { "id": 0, "a_type": "conductor", "a_id": 9001, "b_type": "conductor", "b_id": 9002, "class": "extension" },
-    { "id": 1, "a_type": "conductor", "a_id": 9001, "b_type": "pole", "b_id": 501, "class": "support" },
-    { "id": 2, "a_type": "building", "a_id": 40, "b_type": "building", "b_id": 42, "class": "adjacent" },
-    { "id": 3, "a_type": "building", "a_id": 42, "b_type": "tree", "b_id": 3, "class": "near" }
   ],
 
   "buildings": [
@@ -159,6 +162,19 @@ Each `graph_<tile_id>.json` contains only topological and semantic data:
   ],
   "electrical_grids": [
     { "id": 0, "span_ids": [0, 1, 2], "label": "Grid (3 spans)" }
+  ]
+}
+```
+
+**`graph_<tile_id>_edges.json`**:
+
+```json
+{
+  "edges": [
+    { "id": 0, "a_type": "conductor", "a_id": 9001, "b_type": "conductor", "b_id": 9002, "class": "extension" },
+    { "id": 1, "a_type": "conductor", "a_id": 9001, "b_type": "pole", "b_id": 501, "class": "support" },
+    { "id": 2, "a_type": "building", "a_id": 40, "b_type": "building", "b_id": 42, "class": "adjacent" },
+    { "id": 3, "a_type": "building", "a_id": 42, "b_type": "tree", "b_id": 3, "class": "near" }
   ]
 }
 ```
