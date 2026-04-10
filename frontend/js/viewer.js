@@ -27,7 +27,7 @@ export const state = {
 
 export function initScene(container) {
     state.scene = new THREE.Scene();
-    state.scene.background = new THREE.Color(0xf0f0f0);
+    state.scene.background = new THREE.Color(0xffffff);
 
     state.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 5000);
     // Start in a top-down view: camera along +Z looking towards the XY plane (z=0)

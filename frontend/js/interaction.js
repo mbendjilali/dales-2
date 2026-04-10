@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { state } from './viewer.js?v=14';
+import { state } from './viewer.js?v=15';
 import { editGroup, saveTile } from './api.js';
 
 let raycaster = new THREE.Raycaster();

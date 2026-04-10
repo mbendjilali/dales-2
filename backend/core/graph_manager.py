@@ -12,6 +12,8 @@ from backend.core.graph_edges import (
     to_frontend_group_relations,
     PROXIMITY_EDGE_CLASSES,
     conductor_pole_ids_from_edges,
+    canonical_edge,
+    delete_proximity_edges_for_canonical_pair,
 )
 from backend.core.graph_io import load_merged_graph, save_split_graph, is_graph_edges_file
 
@@ -200,11 +202,17 @@ class GraphManager:
             if pt not in TREE_PEER_TYPES:
                 raise ValueError(f"Invalid peer_type={peer_type!r}")
             tree_id, peer_id = self._normalize_tree_peer_endpoints(int(a_id), int(b_id), pt)
+            ca, cia, cb, cib = canonical_edge("tree", tree_id, pt, peer_id)
+            delete_proximity_edges_for_canonical_pair(self.graph_data, ca, cia, cb, cib)
             e = upsert_unified_edge(
                 self.graph_data, "tree", tree_id, pt, peer_id, rel_class
             )
         else:
             a_ord, b_ord = sorted((int(a_id), int(b_id)))
+            ca, cia, cb, cib = canonical_edge(
+                member_type, a_ord, member_type, b_ord
+            )
+            delete_proximity_edges_for_canonical_pair(self.graph_data, ca, cia, cb, cib)
             e = upsert_unified_edge(
                 self.graph_data,
                 member_type,

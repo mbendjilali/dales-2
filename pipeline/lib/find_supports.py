@@ -1,7 +1,7 @@
 import json
 import argparse
 import math
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 from pipeline.lib.find_extensions import dist3d
 
@@ -78,12 +78,15 @@ def reconstruct_footprints(
 
     return nodes, reconstructed_count
 
-def reconstruct_supports(json_file: str) -> None:
+def reconstruct_supports(json_file: str, global_min_z: Optional[float] = None) -> None:
     with open(json_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
     nodes = data.get('nodes', [])
     links = data.get('links', [])
-    min_z = min(n.get('Z', 0) for n in nodes)
+    if global_min_z is not None:
+        min_z = global_min_z
+    else:
+        min_z = min(n.get('Z', 0) for n in nodes)
     node_attachments, node_conductor_ids = get_node_attachments(nodes, links)
     print("\n--- Pole Conductor IDs ---")
     for nid in sorted(node_conductor_ids.keys()):
@@ -94,6 +97,11 @@ def reconstruct_supports(json_file: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find supports and reconstruct pole footprints.")
     parser.add_argument("json_file", help="Path to the JSON file.")
-    parser.add_argument("--global-min-z", type=float, default=0.0, help="Global min Z for all poles.")
+    parser.add_argument(
+        "--global-min-z",
+        type=float,
+        default=None,
+        help="Global min Z for all poles (default: minimum pole Z from the file).",
+    )
     args = parser.parse_args()
     reconstruct_supports(args.json_file, global_min_z=args.global_min_z)

@@ -196,6 +196,7 @@ async def load_laz(
         from pipeline.lib.add_trees import process_graph as process_trees
         from pipeline.lib.add_conductor_instances import process_graph as process_conductor_instances
         from pipeline.lib.add_pole_instances import process_graph as process_pole_instances
+        from pipeline.lib.instance_ids import mark_virtual_poles_from_geom
         from pipeline.lib.generate_json_graph import adjust_instances
         from backend.core.graph_edges import strip_proximity_edges, rewire_graph_to_laz_instance_ids
 
@@ -232,8 +233,9 @@ async def load_laz(
         process_vehicles(graph_data, geom_data, 1000, 0.5, 5.0, laz_data)
         process_trees(graph_data, geom_data, 8.0, laz_data)
         process_conductor_instances(graph_data, geom_data, laz_data)
+        mark_virtual_poles_from_geom(graph_data, geom_data)
         process_pole_instances(graph_data, geom_data, laz_data)
-        rewire_graph_to_laz_instance_ids(graph_data, geom_data)
+        rewire_graph_to_laz_instance_ids(graph_data, geom_data, laz_data)
 
         gm = GraphManager(data_dir="data")
         gm.graph_data = graph_data

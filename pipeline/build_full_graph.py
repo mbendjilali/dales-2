@@ -10,6 +10,7 @@ from pipeline.lib.add_vehicules import process_graph as process_vehicles
 from pipeline.lib.add_trees import process_graph as process_trees
 from pipeline.lib.add_conductor_instances import process_graph as process_conductor_instances
 from pipeline.lib.add_pole_instances import process_graph as process_pole_instances
+from pipeline.lib.instance_ids import mark_virtual_poles_from_geom
 from pipeline.lib.generate_json_graph import adjust_instances
 from pipeline.lib.geom_utils import load_laz_points
 from backend.core.graph_manager import GraphManager, _groups_key
@@ -117,8 +118,9 @@ def build_full_graph(
             process_vehicles(graph_data, geom_data, max_vehicles, vehicle_spacing, veh_group_tol, laz_data)
             process_trees(graph_data, geom_data, tree_group_tol, laz_data)
             process_conductor_instances(graph_data, geom_data, laz_data)
+            mark_virtual_poles_from_geom(graph_data, geom_data)
             process_pole_instances(graph_data, geom_data, laz_data)
-            rewire_graph_to_laz_instance_ids(graph_data, geom_data)
+            rewire_graph_to_laz_instance_ids(graph_data, geom_data, laz_data)
 
             gm = GraphManager(data_dir=os.path.dirname(graph_dir))
             gm.graph_data = graph_data
@@ -143,7 +145,7 @@ def build_full_graph(
             graph_data = gm.graph_data
             geom_data = gm.geom_data
         else:
-            rewire_graph_to_laz_instance_ids(graph_data, geom_data)
+            rewire_graph_to_laz_instance_ids(graph_data, geom_data, None)
 
         save_split_graph(graph_path, graph_data)
         os.makedirs(geom_dir, exist_ok=True)

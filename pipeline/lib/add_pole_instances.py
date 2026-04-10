@@ -42,6 +42,8 @@ def process_graph(
         pid = pole.get("id")
         if pid is None:
             continue
+        if pole.get("is_virtual_pole"):
+            continue
         g = gp.get(str(int(pid)))
         if not g:
             continue

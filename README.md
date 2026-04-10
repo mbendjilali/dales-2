@@ -1,6 +1,22 @@
-# Network Reasoning
+# DALES 2 — scene graph tool
 
-A scene graph construction and editing tool for classified 3D point clouds. It processes LiDAR data (LAZ/LAS) with semantic and instance labels to produce structured JSON graphs capturing spatial topology and inter-object relations. An integrated web-based 3D viewer enables interactive inspection, grouping, and relation editing.
+**Network Reasoning** is the scene-graph construction and editing stack for **DALES 2: A Renovated Aerial LiDAR Benchmark for 3D Scene Understanding**, accepted at the **USM3D** workshop at **CVPR 2026**. Camera-ready LaTeX sources: [`DALES 2 A Renovated Aerial LiDAR Benchmark for 3D Scene Understanding CVPRW26/`](DALES%202%20A%20Renovated%20Aerial%20LiDAR%20Benchmark%20for%203D%20Scene%20Understanding%20CVPRW26/).
+
+It processes classified LiDAR (LAZ/LAS) with semantic and instance labels into JSON graphs (topology and relations) and provides a **FastAPI + Three.js** viewer for inspection, macro-instance grouping, and relation editing.
+
+### Citation
+
+If you use this code or the DALES 2 benchmark, please cite the workshop paper (update `pages` when proceedings are available):
+
+```bibtex
+@inproceedings{bendjilali2026dales2,
+  title     = {{DALES} 2: A Renovated Aerial {LiDAR} Benchmark for 3D Scene Understanding},
+  author    = {Bendjilali, Moussa and Peyran, Claire and Velumani, Kaaviya and Mauri, Antoine and Luminari, Nicola and Alliez, Pierre},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition Workshops},
+  year      = {2026},
+  note      = {USM3D workshop},
+}
+```
 
 ## Project Structure
 
@@ -19,8 +35,10 @@ pipeline/                 Batch processing pipeline
     add_vehicules.py        Vehicle extraction and OBB-based clustering
     add_trees.py            Tree extraction and OBB-based clustering
     add_conductor_instances.py  LAZ instance id on conductors (powerline match)
+    add_pole_instances.py       LAZ instance id on poles (pole-class match)
+    instance_ids.py             Virtual-pole marking and id allocation helpers
     find_extensions.py      Conductor extension detection
-    find_supports.py        Pole–building support detection
+    find_supports.py        Pole footprint reconstruction / support helpers
     geom_utils.py           LAZ loading, DBSCAN-OBB, geometry helpers
 
 frontend/                 Three.js web viewer
@@ -33,11 +51,12 @@ frontend/                 Three.js web viewer
   css/style.css           Styling
 
 scripts/                  Standalone utilities
-  count_edges.py          CSV report of edge types across all graph files
-  visualize_network.py    Matplotlib-based network visualization
-  dev/                    Development checks (not part of the release pipeline)
-    check_laz_instance_uniqueness.py  Verify instance id ↔ one semantic class per LAZ
+  count_edges.py          CSV report of edge types (writes edge_counts.csv in cwd; gitignored)
+  visualize_network.py    Static HTML export (embedded Three.js) for a tile; optional point cloud overlay
+  dev/                    Optional LAZ / graph QA (not used by build_full_graph.py)
+    check_laz_instance_uniqueness.py  Verify one semantic class per instance id per LAZ
     remap_laz_instance_ids.py         Remap: stuff classes → instance 0; others → 1..N
+    count_graph_relation_edges.py     Count edges by relation class and endpoint types
 
 data/                     Runtime data (not tracked in git)
   network/                Raw network JSON files (poles, conductors)
@@ -69,13 +88,15 @@ The point cloud classification follows a 15-class taxonomy:
 
 ## Installation
 
-**Requirements:** Python 3.8+, a modern browser with WebGL support.
+**Requirements:** Python 3.8+, a modern browser with WebGL support and **network access** on first load (Three.js is loaded from [unpkg](https://unpkg.com/) in `frontend/index.html`). For fully offline use, vendor the Three.js build into `frontend/` and point the import map to local files.
 
 ```bash
 pip install -r requirements.txt
 ```
 
 Dependencies: `fastapi`, `uvicorn`, `numpy`, `scipy`, `laspy`, `scikit-image`, `shapely`, `networkx`, `pydantic`, `tqdm`, `python-multipart`.
+
+**Deployment:** `backend/main.py` enables CORS for `http://localhost` and `http://localhost:8000` only. To serve the API from another origin, extend `origins` before production use.
 
 ## Data Preparation
 
@@ -181,7 +202,7 @@ Graphs are stored as **two files per tile** (and the same pattern for edits: `gr
 
 ### `edges` (single relation list)
 
-Every link uses **`{ "id", "a_type", "b_type", "a_id", "b_id", "class" }`**. Types include `building`, `conductor`, `pole`, `tree`, `vehicle`. Classes include **`extension`**, **`bifurcation`**, **`cross`**, **`support`** (conductor–pole), **`support_building`** (conductor–building), **`adjacent`**, **`near`**. Endpoints are stored in **canonical order** (type order then id). After `rewire_graph_to_laz_instance_ids`, **`a_id` / `b_id` for `conductor`** are **`instance_id`** values (LAZ when matched, else a synthetic id). **`pole`** endpoints use LAZ instance ids when matched.
+Every link uses **`{ "id", "a_type", "b_type", "a_id", "b_id", "class" }`**, optionally **`virtual_pole`: `true`** when a **`pole`** endpoint is a virtual pole (network-only / no PCL pole). Types include `building`, `conductor`, `pole`, `tree`, `vehicle`. Classes include **`extension`**, **`bifurcation`**, **`cross`**, **`support`** (conductor–pole), **`support_building`** (conductor–building), **`adjacent`**, **`near`**. Endpoints are stored in **canonical order** (type order then id). After `rewire_graph_to_laz_instance_ids`, **`a_id` / `b_id` for `conductor`** are **`instance_id`** values; **`pole`** endpoints use LAZ pole instances when matched, else synthetic ids allocated after all PCL instance labels and other graph ids (see `pipeline.lib.instance_ids`).
 
 The HTTP API and viewer receive a derived **`group_relations`** array (member_type, group_id, optional peer_type) built from proximity edges for the UI.
 
@@ -198,7 +219,7 @@ The HTTP API and viewer receive a derived **`group_relations`** array (member_ty
 
 For `buildings`, `vehicles`, and `trees`, the graph object **`id`** is the LAZ **`instance`** value from the point cloud (via `pipeline.lib.geom_utils.load_laz_points`). The dataset guarantees **global uniqueness** of instance IDs across semantic classes within a tile, so no extra encoding is applied. **`sem_class`** is stored on **buildings** and **vehicles**; **trees** in the graph are only `{ "id" }` (semantic class for trees is fixed in the LAZ pipeline).
 
-For **`conductors`**, **`link_idx`** and **`conductor_id`** stay as in the network; geometry keys remain **`"{link_idx}_{conductor_id}"`**. During graph generation a temporary numeric **`uid`** links edges until **`rewire_graph_to_laz_instance_ids`**: it assigns **`instance_id`** from **powerline** points when possible (`pipeline.lib.add_conductor_instances`), otherwise a **synthetic** id (`SYNTHETIC_CONDUCTOR_INSTANCE_ID_BASE + uid` in `backend.core.graph_edges`), rewrites **`edges`**, then **removes `uid`** from saved graphs. **`poles`** get **`instance_id`** from pole-class points (classes 9–11, `pipeline.lib.add_pole_instances`); **`poles[].id`** and **`geom_*.json` pole keys** follow LAZ instances when uniquely mappable.
+For **`conductors`**, **`link_idx`** and **`conductor_id`** stay as in the network; geometry keys remain **`"{link_idx}_{conductor_id}"`**. During graph generation a temporary numeric **`uid`** links edges until **`rewire_graph_to_laz_instance_ids`**: it assigns **`instance_id`** from **powerline** points when possible (`pipeline.lib.add_conductor_instances`), otherwise the next integer **not** present in the tile’s PCL instance field nor already used by buildings / vehicles / trees / other graph objects (`next_free_tile_id` in `pipeline.lib.instance_ids`). **`poles`** marked **`is_virtual_pole`** (from geometry: virtual footprint or centroid-only) skip LAZ pole matching; others get **`instance_id`** from pole-class points (9–11, `pipeline.lib.add_pole_instances`). **`rewire_graph_to_laz_instance_ids`** then resolves cross-class id clashes, rewrites **`edges`** (with **`virtual_pole`** where relevant), and **removes `uid`** from conductors.
 
 The viewer scene conductor object uses only **`id`** (string form of **`instance_id`**).
 
@@ -234,7 +255,7 @@ Each `geom_<tile_id>.json` contains visualization data only:
 | Click               | Select object                       |
 | Shift + Click       | Multi-select (add to selection)     |
 | Shift + Drag        | Lasso selection                     |
-| Double Click         | Clear selection / Reset view        |
+| Double click          | Clear selection / Reset view        |
 | Left Drag           | Rotate camera                       |
 | Right Drag          | Pan camera                          |
 | Scroll              | Zoom                                |
@@ -276,4 +297,4 @@ Each `geom_<tile_id>.json` contains visualization data only:
 
 ## License
 
-*To be determined.*
+Released under the [MIT License](LICENSE).

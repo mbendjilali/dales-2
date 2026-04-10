@@ -7,6 +7,8 @@ import json
 import os
 from typing import Any, Dict, List
 
+from backend.core.graph_edges import dedupe_proximity_edges
+
 
 def is_graph_edges_file(path: str) -> bool:
     return os.path.basename(path).endswith("_edges.json")
@@ -38,11 +40,13 @@ def load_merged_graph(graph_path: str) -> Dict[str, Any]:
 
     out = dict(nodes)
     out["edges"] = edges
+    dedupe_proximity_edges(out)
     return out
 
 
 def save_split_graph(graph_path: str, graph_data: Dict[str, Any]) -> None:
     """Write nodes (no top-level \"edges\") and companion *_edges.json."""
+    dedupe_proximity_edges(graph_data)
     edges = graph_data.get("edges") or []
     save_nodes = {
         k: v

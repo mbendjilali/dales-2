@@ -1,9 +1,10 @@
 data/network/*
 data/geometry/*
 data/graph/*
-dales_2
 pipeline/__pycache__/*
 pipeline/lib/__pycache__/*
 backend/__pycache__/*
 backend/core/__pycache__/*
-scripts/dev
+scripts/dev/__pycache__/*
+edge_counts.csv
+DALES 2 A Renovated Aerial LiDAR Benchmark for 3D Scene Understanding CVPRW26/
